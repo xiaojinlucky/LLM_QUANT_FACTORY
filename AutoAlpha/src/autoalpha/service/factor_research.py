@@ -9,6 +9,7 @@ and versioned factor artifacts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -35,8 +36,11 @@ DUPLICATE = "DUPLICATE"
 TRAIN_FAILED = "TRAIN_FAILED"
 VALIDATION_FAILED = "VALIDATION_FAILED"
 BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
+REJECTED = "REJECTED"
 
-_REJECTED_STATUSES = frozenset({INVALID, DUPLICATE, TRAIN_FAILED, VALIDATION_FAILED})
+_REJECTED_STATUSES = frozenset(
+    {INVALID, DUPLICATE, TRAIN_FAILED, VALIDATION_FAILED, BUDGET_EXHAUSTED}
+)
 _DEFAULT_CORRELATION_THRESHOLD = 0.85
 
 
@@ -131,6 +135,7 @@ class _CandidateOutcome:
     validation_metrics: dict[str, Any] = dataclass_field(default_factory=dict)
     core_metrics: dict[str, Any] = dataclass_field(default_factory=dict)
     repair_count: int = 0
+    parent_factor_id: str | None = None
     duplicate_of: str | None = None
     registry_artifact_hash: str | None = None
 
@@ -147,6 +152,7 @@ class _CandidateOutcome:
                 "validation_metrics": self.validation_metrics,
                 "core_metrics": self.core_metrics,
                 "repair_count": self.repair_count,
+                "parent_factor_id": self.parent_factor_id,
                 "duplicate_of": self.duplicate_of,
                 "registry_artifact_hash": self.registry_artifact_hash,
             }
@@ -447,6 +453,7 @@ def _process_candidate(
     candidate_key = f"{run_id}-candidate-{ordinal:02d}"
     _begin_iteration(store, run_id, ordinal)
     repair_count = 0
+    parent_factor_id: str | None = None
     while True:
         try:
             factor = _factor_from_raw(proposal)
@@ -460,6 +467,7 @@ def _process_candidate(
                 proposal,
                 candidate_key,
                 repair_count=repair_count,
+                parent_factor_id=parent_factor_id,
             )
             repaired = _try_repair(
                 outcome,
@@ -471,6 +479,8 @@ def _process_candidate(
             )
             if repaired is None:
                 return _finish_candidate(store, run_id, ordinal, outcome)
+            if outcome.factor is not None and parent_factor_id is None:
+                parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
             proposal = _safe_proposal_dict(repaired)
             continue
@@ -485,6 +495,7 @@ def _process_candidate(
             candidate_key,
             factor=factor,
             repair_count=repair_count,
+            parent_factor_id=parent_factor_id,
         )
         if factor.expression.expression_hash in seen_hashes:
             outcome.status = DUPLICATE
@@ -508,6 +519,8 @@ def _process_candidate(
             )
             if repaired is None:
                 return _finish_candidate(store, run_id, ordinal, outcome)
+            if outcome.factor is not None and parent_factor_id is None:
+                parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
             proposal = _safe_proposal_dict(repaired)
             continue
@@ -534,6 +547,8 @@ def _process_candidate(
             )
             if repaired is None:
                 return _finish_candidate(store, run_id, ordinal, outcome)
+            if outcome.factor is not None and parent_factor_id is None:
+                parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
             proposal = _safe_proposal_dict(repaired)
             continue
@@ -550,6 +565,8 @@ def _process_candidate(
             )
             if repaired is None:
                 return _finish_candidate(store, run_id, ordinal, outcome)
+            if outcome.factor is not None and parent_factor_id is None:
+                parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
             proposal = _safe_proposal_dict(repaired)
             continue
@@ -571,6 +588,8 @@ def _process_candidate(
             )
             if repaired is None:
                 return _finish_candidate(store, run_id, ordinal, outcome)
+            if outcome.factor is not None and parent_factor_id is None:
+                parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
             proposal = _safe_proposal_dict(repaired)
             continue
@@ -655,6 +674,9 @@ def _persist_keep(
         "research_train_metrics": outcome.train_metrics,
         "research_validation_metrics": outcome.validation_metrics,
         "research_core_metrics": outcome.core_metrics,
+        "expression_hash": outcome.factor.expression.expression_hash,
+        "fields": sorted(_expression_fields(outcome.factor.expression)),
+        "parent_factor_id": outcome.parent_factor_id,
         "admission": "MVP_RESEARCH_ONLY",
     }
     store.upsert_factor_pool(
@@ -703,7 +725,10 @@ def _finish_candidate(
         "train_metrics": outcome.train_metrics,
         "validation_metrics": outcome.validation_metrics,
         "core_metrics": outcome.core_metrics,
+        "parent_factor_id": outcome.parent_factor_id,
     }
+    if outcome.status != KEEP:
+        _persist_rejected_history(store, run_id, ordinal, outcome, metrics)
     finish = getattr(store, "finish_iteration", None)
     if callable(finish):
         finish(
@@ -722,6 +747,47 @@ def _finish_candidate(
             run_id, ordinal, "factor_research", json.dumps(_json_safe(metrics), sort_keys=True)
         )
     return outcome
+
+
+def _persist_rejected_history(
+    store: Any,
+    run_id: str,
+    ordinal: int,
+    outcome: _CandidateOutcome,
+    metrics: dict[str, Any],
+) -> None:
+    """Keep a small rejected-candidate record without polluting KEEP factors."""
+
+    upsert = getattr(store, "upsert_factor_pool", None)
+    if not callable(upsert):
+        return
+    candidate_hash = hashlib.sha256(
+        json.dumps(
+            _json_safe(outcome.proposal),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    rejected_id = f"R_{run_id}_{ordinal:02d}"
+    rejected_metrics = {
+        **metrics,
+        "candidate_id": outcome.candidate_id,
+        "candidate_hash": candidate_hash,
+        "admission": "MVP_RESEARCH_REJECTED_HISTORY",
+    }
+    try:
+        upsert(
+            factor_id=rejected_id,
+            source_iteration=ordinal,
+            source_task_id=f"factor-research:{run_id}",
+            proposal=outcome.proposal,
+            metrics=_json_safe(rejected_metrics),
+            status=REJECTED,
+            status_reason=f"{outcome.status}:{outcome.reason}",
+        )
+    except Exception as error:  # rejected history must not destroy the run
+        outcome.reason += f"; rejected_history_persist_failed:{type(error).__name__}"
 
 
 def _begin_iteration(store: Any, run_id: str, ordinal: int) -> None:
@@ -941,7 +1007,14 @@ def _existing_factors(store: Any) -> list[FactorDefinition]:
     records = getattr(store, "factor_pool", lambda **_: [])(limit=5000)
     result: list[FactorDefinition] = []
     for record in records:
-        if str(record.get("status", "")) in {INVALID, DUPLICATE, TRAIN_FAILED, VALIDATION_FAILED}:
+        if str(record.get("status", "")) in {
+            REJECTED,
+            INVALID,
+            DUPLICATE,
+            TRAIN_FAILED,
+            VALIDATION_FAILED,
+            BUDGET_EXHAUSTED,
+        }:
             continue
         try:
             result.append(_factor_from_raw(record["proposal"]))
@@ -1045,6 +1118,8 @@ def _normalized_proposal(raw: Mapping[str, Any], factor: FactorDefinition) -> di
             "hypothesis": factor.hypothesis,
             "expected_direction": factor.expected_direction,
             "expression": factor.expression.to_dict(),
+            "expression_hash": factor.expression.expression_hash,
+            "fields": sorted(_expression_fields(factor.expression)),
         }
     )
     return _json_safe(proposal)

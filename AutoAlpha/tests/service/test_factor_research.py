@@ -10,6 +10,7 @@ from autoalpha.service.factor_research import (
     DUPLICATE,
     INVALID,
     KEEP,
+    REJECTED,
     VALIDATION_FAILED,
     run_factor_research,
 )
@@ -133,9 +134,14 @@ def test_factor_research_mvp_keeps_only_valid_non_duplicate_candidates(tmp_path)
     assert len(evaluator.portfolio_calls) == 1
 
     pool = store.factor_pool()
-    assert len(pool) == 1
-    assert pool[0]["status"] == KEEP
-    factor_id = pool[0]["factor_id"]
+    keep_pool = [item for item in pool if item["status"] == KEEP]
+    rejected_pool = [item for item in pool if item["status"] == REJECTED]
+    assert len(keep_pool) == 1
+    assert len(rejected_pool) == 3
+    assert all(item["metrics"]["candidate_hash"] for item in rejected_pool)
+    assert keep_pool[0]["proposal"]["expression_hash"]
+    assert keep_pool[0]["proposal"]["fields"] == ["close"]
+    factor_id = keep_pool[0]["factor_id"]
     assert store.factor_knowledge(factor_id) is not None
     assert len(FactorRegistry(tmp_path / "factor-registry").versions(factor_id)) == 1
 
@@ -169,6 +175,32 @@ def test_factor_research_mvp_repair_is_bounded(tmp_path) -> None:
     assert summary["usage"]["repairs"] == 1
     assert summary["candidates"][0]["repair_count"] == 1
     assert summary["candidates"][0]["status"] == INVALID
+
+
+def test_factor_research_mvp_persists_repaired_factor_parent(tmp_path) -> None:
+    class RepairingResearcher(FakeResearcher):
+        def repair(self, proposal: dict, feedback: str, context: dict) -> dict:
+            return _proposal("repaired_keep", field("close").to_dict())
+
+    summary = run_factor_research(
+        "测试修复谱系",
+        candidate_count=1,
+        rounds=1,
+        researcher=RepairingResearcher(
+            [_proposal("D_validation_failed", field("amount").to_dict())]
+        ),
+        evaluator=FakeEvaluator(),
+        store=ServiceStore(tmp_path / "autoalpha.sqlite3"),
+        registry=FactorRegistry(tmp_path / "factor-registry"),
+        output_dir=tmp_path / "summary",
+    )
+
+    candidate = summary["candidates"][0]
+    assert candidate["status"] == KEEP
+    assert candidate["repair_count"] == 1
+    assert candidate["parent_factor_id"]
+    assert candidate["proposal"]["expression_hash"]
+    assert candidate["proposal"]["fields"] == ["close"]
 
 
 def test_factor_research_mvp_marks_summary_partial_when_llm_budget_is_exhausted(
