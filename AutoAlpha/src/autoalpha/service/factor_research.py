@@ -249,6 +249,7 @@ def run_factor_research(
     store: ServiceStore | Any | None = None,
     registry: FactorRegistry | None = None,
     output_dir: Path | None = None,
+    data_path: Path | None = None,
     maximum_repairs_per_candidate: int = 1,
     maximum_llm_calls: int | None = None,
     maximum_candidate_evaluations: int | None = None,
@@ -276,7 +277,7 @@ def run_factor_research(
     run_id = _run_id()
     runtime_root = _runtime_root()
     resolved_store = store or ServiceStore(runtime_root / "autoalpha.sqlite3")
-    resolved_evaluator = evaluator or _default_evaluator()
+    resolved_evaluator = evaluator or _default_evaluator(resolved_store, data_path=data_path)
     resolved_researcher = researcher or _default_researcher(resolved_store)
     resolved_registry = registry or FactorRegistry(runtime_root / "factor-registry")
     artifact_dir = Path(output_dir or runtime_root / "factor-research" / run_id)
@@ -285,6 +286,7 @@ def run_factor_research(
     run_budget = _RunBudget()
     candidates: list[_CandidateOutcome] = []
     kept_factors: list[FactorDefinition] = []
+    kept_outcomes: list[_CandidateOutcome] = []
     seen_hashes = _existing_expression_hashes(resolved_store)
     existing_factors = _existing_factors(resolved_store)
     generation_errors: list[str] = []
@@ -323,27 +325,45 @@ def run_factor_research(
             continue
         for raw in raw_batch[:remaining]:
             ordinal += 1
-            outcome = _process_candidate(
-                raw,
-                ordinal=ordinal,
-                round_number=round_number,
-                run_id=run_id,
-                direction=direction,
-                researcher=resolved_researcher,
-                evaluator=resolved_evaluator,
-                store=resolved_store,
-                registry=resolved_registry,
-                source_task_id=f"factor-research:{run_id}",
-                seen_hashes=seen_hashes,
-                existing_factors=[*existing_factors, *kept_factors],
-                budget=budget,
-                run_budget=run_budget,
-                correlation_threshold=correlation_threshold,
-                context=context,
-            )
+            try:
+                outcome = _process_candidate(
+                    raw,
+                    ordinal=ordinal,
+                    round_number=round_number,
+                    run_id=run_id,
+                    direction=direction,
+                    researcher=resolved_researcher,
+                    evaluator=resolved_evaluator,
+                    store=resolved_store,
+                    registry=resolved_registry,
+                    source_task_id=f"factor-research:{run_id}",
+                    seen_hashes=seen_hashes,
+                    existing_factors=[*existing_factors, *kept_factors],
+                    budget=budget,
+                    run_budget=run_budget,
+                    correlation_threshold=correlation_threshold,
+                    context=context,
+                )
+            except Exception as error:  # one candidate must not destroy the run
+                generation_errors.append(f"candidate_{ordinal}:{type(error).__name__}")
+                outcome = _CandidateOutcome(
+                    ordinal=ordinal,
+                    round_number=round_number,
+                    status=TRAIN_FAILED,
+                    reason=f"candidate_processing_failed:{type(error).__name__}",
+                    proposal=_safe_proposal_dict(raw),
+                    candidate_id=f"{run_id}-candidate-{ordinal:02d}",
+                )
+                try:
+                    outcome = _finish_candidate(resolved_store, run_id, ordinal, outcome)
+                except Exception as finish_error:
+                    generation_errors.append(
+                        f"candidate_{ordinal}_finalize:{type(finish_error).__name__}"
+                    )
             candidates.append(outcome)
             if outcome.status == KEEP and outcome.factor is not None:
                 kept_factors.append(outcome.factor)
+                kept_outcomes.append(outcome)
             if len(candidates) >= budget.candidate_count:
                 break
         if len(candidates) >= budget.candidate_count:
@@ -355,7 +375,7 @@ def run_factor_research(
     if not candidate_generation_complete and len(candidates) < budget.candidate_count:
         run_budget.exhausted.append("candidate_generation_rounds")
 
-    portfolio = _evaluate_simple_portfolio(resolved_evaluator, kept_factors)
+    portfolio = _evaluate_simple_portfolio(resolved_evaluator, kept_factors, kept_outcomes)
     if portfolio.get("status") == "FAILED":
         generation_errors.append("simple_portfolio:evaluation_failed")
 
@@ -642,7 +662,15 @@ def _try_repair(
     run_budget.llm_calls += 1
     run_budget.repair_counts[outcome.candidate_id] = outcome.repair_count + 1
     outcome.repair_count += 1
-    feedback = outcome.status
+    feedback = json.dumps(
+        {
+            "status": outcome.status,
+            "reason": outcome.reason,
+            "metric_band": _repair_metric_band(outcome.core_metrics),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     try:
         repaired = repair(
             outcome.proposal,
@@ -825,8 +853,16 @@ def _evaluate_stages(
     train_method = getattr(evaluator, "evaluate_train", None)
     validation_method = getattr(evaluator, "evaluate_validation", None)
     if callable(train_method) and callable(validation_method):
-        train = _result_metrics(train_method(factor))
-        validation = _result_metrics(validation_method(factor))
+        try:
+            train = _result_metrics(train_method(factor))
+        except _TrainEvaluationError:
+            raise
+        except Exception as error:
+            raise _TrainEvaluationError("train_evaluation_failed") from error
+        try:
+            validation = _result_metrics(validation_method(factor))
+        except Exception as error:
+            raise RuntimeError("validation_evaluation_failed") from error
         return train, validation
 
     evaluate = getattr(evaluator, "evaluate", None)
@@ -837,7 +873,7 @@ def _evaluate_stages(
     except _TrainEvaluationError:
         raise
     except Exception as error:
-        raise RuntimeError("validation_evaluation_failed") from error
+        raise _TrainEvaluationError("train_evaluation_failed") from error
     train = metrics.get("train_metrics") or metrics.get("exploration_metrics") or {}
     validation = metrics.get("validation_metrics") or metrics
     if not isinstance(train, Mapping):
@@ -975,10 +1011,21 @@ def _behavior_duplicate(
     return None
 
 
-def _evaluate_simple_portfolio(evaluator: Any, factors: list[FactorDefinition]) -> dict[str, Any]:
+def _evaluate_simple_portfolio(
+    evaluator: Any,
+    factors: list[FactorDefinition],
+    outcomes: list[_CandidateOutcome] | None = None,
+) -> dict[str, Any]:
     if not factors:
         return {"status": "NOT_EVALUATED", "reason": "no_KEEP_factors"}
-    selected = factors[:5]
+    ranked_factors = factors
+    if outcomes:
+        ranked_factors = [
+            outcome.factor
+            for outcome in sorted(outcomes, key=_candidate_rank_key, reverse=True)
+            if outcome.factor is not None
+        ]
+    selected = ranked_factors[:5]
     evaluate = getattr(evaluator, "evaluate_portfolio", None)
     if not callable(evaluate):
         return {"status": "FAILED", "reason": "evaluator_missing_portfolio_method"}
@@ -1027,6 +1074,8 @@ def _existing_expression_hashes(store: Any) -> set[str]:
     hashes: set[str] = set()
     records = getattr(store, "factor_pool", lambda **_: [])(limit=5000)
     for record in records:
+        if str(record.get("status", "")) in {*_REJECTED_STATUSES, REJECTED}:
+            continue
         try:
             hashes.add(_factor_from_raw(record["proposal"]).expression.expression_hash)
         except (KeyError, TypeError, ValueError):
@@ -1160,6 +1209,14 @@ def _candidate_rank_key(outcome: _CandidateOutcome) -> tuple[float, float, float
     )
 
 
+def _repair_metric_band(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        name: _json_safe(metrics.get(name))
+        for name in ("coverage", "sharpe", "annual_return", "max_drawdown", "turnover")
+        if name in metrics
+    }
+
+
 def _reason_code(error: Exception, fallback: str) -> str:
     message = str(error).lower()
     if (
@@ -1191,11 +1248,20 @@ def _runtime_root() -> Path:
     return Path(os.getenv("AUTOALPHA_RUNTIME", project_root / "runtime-full-llm"))
 
 
-def _default_evaluator() -> PriceVolumeEvaluator:
+def _default_evaluator(
+    store: Any | None = None, *, data_path: Path | None = None
+) -> PriceVolumeEvaluator:
     project_root = Path(__file__).resolve().parents[3]
-    data_path = Path(os.getenv("AUTOALPHA_DATA_PATH", project_root / "data"))
+    settings = store.settings() if callable(getattr(store, "settings", None)) else {}
+    configured_path = (
+        data_path
+        or os.getenv("AUTOALPHA_DATA_PATH")
+        or settings.get("data_path")
+        or project_root.parent / "data"
+    )
+    resolved_data_path = Path(configured_path).expanduser()
     config_path = Path(os.getenv("AUTOALPHA_CONFIG", project_root / "config/research.toml"))
-    return PriceVolumeEvaluator(data_path, config_path)
+    return PriceVolumeEvaluator(resolved_data_path, config_path)
 
 
 def _default_researcher(store: Any) -> CompatibleChatResearcher:
@@ -1267,9 +1333,9 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
             ).format(
                 name=str(candidate.get("proposal", {}).get("name", candidate["candidate_id"])),
                 status=candidate["status"],
-                sharpe=float(metrics.get("sharpe", 0.0)),
-                annual=float(metrics.get("annual_return", 0.0)),
-                coverage=float(metrics.get("coverage", 0.0)),
+                sharpe=_safe_display_float(metrics.get("sharpe")),
+                annual=_safe_display_float(metrics.get("annual_return")),
+                coverage=_safe_display_float(metrics.get("coverage")),
                 reason=candidate["reason"],
             )
         )
@@ -1294,6 +1360,14 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _safe_display_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _json_safe(value: Any) -> Any:

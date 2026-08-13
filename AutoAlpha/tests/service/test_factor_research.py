@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from autoalpha.dsl.expression import Expression, field
+from autoalpha.dsl.expression import Expression, FactorDefinition, field
 from autoalpha.dsl.semantics import FieldDefinition, SemanticValidator
 from autoalpha.registry.store import FactorRegistry
 from autoalpha.service.factor_research import (
@@ -30,6 +30,7 @@ def _proposal(name: str, expression: dict, *, expected_direction: int = 1) -> di
 class FakeResearcher:
     def __init__(self, proposals: list[dict]) -> None:
         self.proposals = proposals
+        self.repair_feedback: list[str] = []
 
     def propose_batch(
         self,
@@ -41,6 +42,7 @@ class FakeResearcher:
         return self.proposals[:candidate_count]
 
     def repair(self, proposal: dict, feedback: str, context: dict) -> None:
+        self.repair_feedback.append(feedback)
         return None
 
     def conclude(self, summary: dict) -> str:
@@ -107,11 +109,12 @@ def test_factor_research_mvp_keeps_only_valid_non_duplicate_candidates(tmp_path)
     ]
     store = ServiceStore(tmp_path / "autoalpha.sqlite3")
     evaluator = FakeEvaluator()
+    researcher = FakeResearcher(proposals)
     summary = run_factor_research(
         "短期反转",
         candidate_count=4,
         rounds=3,
-        researcher=FakeResearcher(proposals),
+        researcher=researcher,
         evaluator=evaluator,
         store=store,
         registry=FactorRegistry(tmp_path / "factor-registry"),
@@ -152,6 +155,11 @@ def test_factor_research_mvp_keeps_only_valid_non_duplicate_candidates(tmp_path)
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["counts"]["keep"] == 1
     assert "确定性 DSL" in markdown_path.read_text(encoding="utf-8")
+    assert researcher.repair_feedback
+    assert all(
+        '"status"' in feedback and '"reason"' in feedback
+        for feedback in researcher.repair_feedback
+    )
 
 
 def test_factor_research_mvp_repair_is_bounded(tmp_path) -> None:
@@ -221,3 +229,116 @@ def test_factor_research_mvp_marks_summary_partial_when_llm_budget_is_exhausted(
     assert summary["status"] == "PARTIAL_COMPLETED"
     assert summary["usage"]["llm_calls"] == 1
     assert summary["usage"]["exhausted"] == ["maximum_llm_calls"]
+
+
+def test_factor_research_mvp_ranks_simple_portfolio_by_validation_metrics(tmp_path) -> None:
+    class RankingEvaluator(FakeEvaluator):
+        def evaluate(self, factor):  # noqa: ANN001
+            result = super().evaluate(factor)
+            rank = int(factor.name.rsplit("_", 1)[-1])
+            result.metrics["exploration_metrics"]["sharpe"] = rank / 10
+            result.metrics["exploration_metrics"]["simple_annual_return"] = rank / 100
+            result.metrics["long_only_sharpe_ratio"] = rank / 10
+            result.metrics["long_only_simple_annual_return"] = rank / 100
+            return result
+
+    proposals = [
+        _proposal(
+            f"rank_{rank}",
+            Expression.from_dict(
+                {
+                    "operator": "rolling_mean",
+                    "arguments": [field("close").to_dict()],
+                    "parameters": {"window": rank},
+                }
+            ).to_dict(),
+        )
+        for rank in range(1, 6)
+    ]
+    evaluator = RankingEvaluator()
+    run_factor_research(
+        "排序组合",
+        candidate_count=5,
+        rounds=1,
+        researcher=FakeResearcher(proposals),
+        evaluator=evaluator,
+        store=ServiceStore(tmp_path / "autoalpha.sqlite3"),
+        registry=FactorRegistry(tmp_path / "factor-registry"),
+        output_dir=tmp_path / "summary",
+    )
+
+    expected_ids = [
+        FactorDefinition(
+            name=proposal["name"],
+            family=proposal["family"],
+            hypothesis=proposal["hypothesis"],
+            expression=Expression.from_dict(proposal["expression"]),
+        ).factor_id
+        for proposal in reversed(proposals)
+    ][:5]
+    assert evaluator.portfolio_calls == [expected_ids]
+
+
+def test_factor_research_mvp_keeps_non_finite_metrics_out_of_markdown(tmp_path) -> None:
+    class NaNEvaluator(FakeEvaluator):
+        def evaluate(self, factor):  # noqa: ANN001
+            result = super().evaluate(factor)
+            result.metrics["coverage"] = float("nan")
+            return result
+
+    summary = run_factor_research(
+        "非有限指标",
+        candidate_count=1,
+        rounds=1,
+        researcher=FakeResearcher([_proposal("nan_candidate", field("close").to_dict())]),
+        evaluator=NaNEvaluator(),
+        store=ServiceStore(tmp_path / "autoalpha.sqlite3"),
+        registry=FactorRegistry(tmp_path / "factor-registry"),
+        output_dir=tmp_path / "summary",
+    )
+
+    assert summary["candidates"][0]["reason"] == "non_finite_core_metrics"
+    markdown = (tmp_path / "summary" / "research_summary.md").read_text(encoding="utf-8")
+    assert "| nan_candidate | `VALIDATION_FAILED` | 1.100 | 12.00% | 0.00% |" in markdown
+
+
+def test_factor_research_mvp_isolates_candidate_persistence_failure(tmp_path) -> None:
+    class ExplodingStore(ServiceStore):
+        def upsert_factor_pool(self, **kwargs):  # noqa: ANN003
+            raise RuntimeError("simulated_factor_pool_failure")
+
+    summary = run_factor_research(
+        "持久化隔离",
+        candidate_count=1,
+        rounds=1,
+        researcher=FakeResearcher([_proposal("persist_failure", field("close").to_dict())]),
+        evaluator=FakeEvaluator(),
+        store=ExplodingStore(tmp_path / "autoalpha.sqlite3"),
+        registry=FactorRegistry(tmp_path / "factor-registry"),
+        output_dir=tmp_path / "summary",
+    )
+
+    assert summary["status"] == "PARTIAL_COMPLETED"
+    assert summary["candidates"][0]["status"] == "TRAIN_FAILED"
+    assert summary["generation_errors"] == ["candidate_1:RuntimeError"]
+    assert (tmp_path / "summary" / "research_summary.json").exists()
+
+
+def test_factor_research_mvp_rejected_history_does_not_block_a_later_run(tmp_path) -> None:
+    proposal = _proposal(
+        "retry_invalid",
+        {"operator": "future_operator", "arguments": [], "parameters": {}},
+    )
+    store = ServiceStore(tmp_path / "autoalpha.sqlite3")
+    for run_number in (1, 2):
+        summary = run_factor_research(
+            f"重试拒绝候选 {run_number}",
+            candidate_count=1,
+            rounds=1,
+            researcher=FakeResearcher([proposal]),
+            evaluator=FakeEvaluator(),
+            store=store,
+            registry=FactorRegistry(tmp_path / f"factor-registry-{run_number}"),
+            output_dir=tmp_path / f"summary-{run_number}",
+        )
+        assert summary["candidates"][0]["status"] == INVALID

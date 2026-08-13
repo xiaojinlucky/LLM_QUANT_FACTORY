@@ -35,6 +35,12 @@ def _parser() -> argparse.ArgumentParser:
     factor_research.add_argument("research_direction", help="research direction for the Researcher")
     factor_research.add_argument("--candidate-count", type=int, default=4)
     factor_research.add_argument("--rounds", type=int, default=3)
+    factor_research.add_argument(
+        "--data-path",
+        type=Path,
+        default=None,
+        help="A 股日线 parquet 面板目录；未提供时读取 AUTOALPHA_DATA_PATH 或服务设置",
+    )
     factor_research.add_argument("--output-dir", type=Path, default=None)
     return parser
 
@@ -67,6 +73,7 @@ def main() -> None:
             args.research_direction,
             candidate_count=args.candidate_count,
             rounds=args.rounds,
+            data_path=args.data_path,
             output_dir=args.output_dir,
         )
         print(json.dumps(summary, ensure_ascii=False, indent=2))
