@@ -113,7 +113,7 @@ def test_factor_research_mvp_keeps_only_valid_non_duplicate_candidates(tmp_path)
     summary = run_factor_research(
         "短期反转",
         candidate_count=4,
-        rounds=3,
+        rounds=1,
         researcher=researcher,
         evaluator=evaluator,
         store=store,
@@ -160,6 +160,55 @@ def test_factor_research_mvp_keeps_only_valid_non_duplicate_candidates(tmp_path)
         '"status"' in feedback and '"reason"' in feedback
         for feedback in researcher.repair_feedback
     )
+
+
+def test_factor_research_mvp_generates_candidates_per_round(tmp_path) -> None:
+    proposals = [
+        _proposal(
+            f"round_{index:02d}",
+            Expression.from_dict(
+                {
+                    "operator": "rolling_mean",
+                    "arguments": [field("close").to_dict()],
+                    "parameters": {"window": index},
+                }
+            ).to_dict(),
+        )
+        for index in range(1, 13)
+    ]
+
+    class RoundResearcher(FakeResearcher):
+        def __init__(self, values: list[dict]) -> None:
+            super().__init__(values)
+            self.rounds: list[int] = []
+
+        def propose_batch(
+            self,
+            research_direction: str,
+            candidate_count: int,
+            round_number: int,
+            context: dict,
+        ) -> list[dict]:
+            self.rounds.append(round_number)
+            start = (round_number - 1) * candidate_count
+            return self.proposals[start : start + candidate_count]
+
+    researcher = RoundResearcher(proposals)
+    summary = run_factor_research(
+        "多轮候选",
+        candidates_per_round=4,
+        rounds=3,
+        researcher=researcher,
+        evaluator=FakeEvaluator(),
+        store=ServiceStore(tmp_path / "autoalpha.sqlite3"),
+        registry=FactorRegistry(tmp_path / "factor-registry"),
+        output_dir=tmp_path / "summary",
+    )
+
+    assert researcher.rounds == [1, 2, 3]
+    assert len(summary["candidates"]) == 12
+    assert summary["counts"]["requested"] == 12
+    assert summary["budgets"]["total_candidates"] == 12
 
 
 def test_factor_research_mvp_repair_is_bounded(tmp_path) -> None:

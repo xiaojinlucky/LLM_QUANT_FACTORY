@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -56,6 +57,7 @@ from autoalpha.service.factor_homogeneity import (
     factor_homogeneity_integrity,
 )
 from autoalpha.service.factor_library import build_factor_library
+from autoalpha.service.factor_research import build_factor_research_web_result
 from autoalpha.service.full_llm import role_catalog, summarize_research_team_domains
 from autoalpha.service.gate_feedback import gate_feedback_policy
 from autoalpha.service.manual_backtest import ManualBacktestSpec, ManualFactorBacktester
@@ -617,6 +619,18 @@ class SystemJobRunNextRequest(BaseModel):
     max_global_running: int | None = Field(default=None, ge=1, le=512)
 
 
+class FactorResearchRunRequest(BaseModel):
+    research_task_id: str = Field(min_length=2, max_length=120)
+    research_direction: str = Field(min_length=1, max_length=500)
+    candidates_per_round: int = Field(default=4, ge=1, le=100)
+    rounds: int = Field(default=3, ge=1, le=20)
+
+    @field_validator("research_task_id", "research_direction")
+    @classmethod
+    def clean_factor_research_text(cls, value: str) -> str:
+        return value.strip()
+
+
 class ManualBacktestMetadataRequest(BaseModel):
     favorite: bool = True
     title: str | None = Field(default=None, max_length=100)
@@ -698,8 +712,10 @@ system_job_runner = SystemJobRunner(
     quantcombine_store=quant_store,
     runtime_root=RUNTIME_ROOT,
     market_data_sync_runner=data_sync_worker.run_system_job,
+    research_task_manager=research_manager,
 )
 system_job_scheduler_task: asyncio.Task[None] | None = None
+SYSTEM_JOB_QUEUES = ("system", "factor-research")
 
 
 def _system_job_scheduler_status() -> dict[str, Any]:
@@ -718,6 +734,7 @@ def _system_job_scheduler_status() -> dict[str, Any]:
         "alive": alive,
         "status": status,
         "queue": "system",
+        "queues": list(SYSTEM_JOB_QUEUES),
         "poll_seconds": {"claimed": 2, "idle": 15, "after_error": 30},
         "supported_job_types": sorted(SUPPORTED_SYSTEM_JOB_TYPES),
         "failure": failure,
@@ -1051,10 +1068,14 @@ app = FastAPI(title="AutoAlpha Control Plane", version="0.7.0-full-llm", lifespa
 app.mount("/static", StaticFiles(directory=PACKAGE_ROOT / "static"), name="static")
 
 
-async def _system_job_scheduler_loop() -> None:
+async def _system_job_queue_loop(queue: str) -> None:
     while True:
         try:
-            result = await asyncio.to_thread(system_job_runner.run_next, queue="system")
+            result = await asyncio.to_thread(
+                system_job_runner.run_next,
+                queue=queue,
+                lease_seconds=3600 if queue == "factor-research" else 900,
+            )
             await asyncio.sleep(2 if result.get("claimed") else 15)
         except asyncio.CancelledError:
             raise
@@ -1063,10 +1084,15 @@ async def _system_job_scheduler_loop() -> None:
                 "audit",
                 "SYSTEM_JOB_SCHEDULER_ERROR",
                 "系统作业调度器异常",
-                f"{type(error).__name__}: {error}",
+                f"queue={queue} · {type(error).__name__}: {error}",
+                payload={"queue": queue},
                 level="ERROR",
             )
             await asyncio.sleep(30)
+
+
+async def _system_job_scheduler_loop() -> None:
+    await asyncio.gather(*(_system_job_queue_loop(queue) for queue in SYSTEM_JOB_QUEUES))
 
 
 def _runtime_database_health() -> dict[str, Any]:
@@ -2640,6 +2666,185 @@ async def approve_formal_strategy(
         },
     )
     return strategy
+
+
+def _safe_factor_research_error(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "<redacted-secret>", text)
+    return re.sub(
+        r"(?:[A-Za-z]:[\\/]|/)(?:[^\s,;]+[\\/])*[^\s,;]*",
+        "<redacted-path>",
+        text,
+    )
+
+
+def _factor_research_result_view(
+    result: dict[str, Any], *, job_id: str
+) -> dict[str, Any]:
+    if result.get("protocol") == "AUTOALPHA_FACTOR_RESEARCH_WEB_RESULT_V1":
+        safe = {
+            key: result.get(key)
+            for key in (
+                "protocol",
+                "run_id",
+                "status",
+                "research_direction",
+                "research_context",
+                "counts",
+                "status_counts",
+                "candidates",
+                "top_factors",
+                "simple_portfolio",
+                "llm_conclusion",
+                "production_promotion",
+                "factor_library_refresh",
+                "research_task_id",
+                "progress",
+            )
+            if key in result
+        }
+    else:
+        run_id = str(result.get("run_id") or job_id)
+        safe = build_factor_research_web_result(
+            result,
+            artifact_prefix=f"factor-research/{run_id}",
+        )
+    run_id = str(safe.get("run_id") or job_id)
+    safe["artifacts"] = [
+        {
+            "artifact_id": f"factor-research/{run_id}/research_summary.json",
+            "name": "research_summary.json",
+            "media_type": "application/json",
+        },
+        {
+            "artifact_id": f"factor-research/{run_id}/research_summary.md",
+            "name": "research_summary.md",
+            "media_type": "text/markdown",
+        },
+    ]
+    return safe
+
+
+def _factor_research_job_view(job: dict[str, Any]) -> dict[str, Any]:
+    payload = job.get("payload") or {}
+    stored_result = job.get("result") or {}
+    result = stored_result
+    if isinstance(stored_result, dict) and stored_result.get("partial_result"):
+        result = stored_result["partial_result"]
+    if not isinstance(result, dict):
+        result = {}
+    public_result = (
+        _factor_research_result_view(result, job_id=str(job["job_id"]))
+        if result
+        else {}
+    )
+    lifecycle = {
+        key: job.get(key)
+        for key in (
+            "job_id",
+            "queue",
+            "job_type",
+            "status",
+            "priority",
+            "progress_current",
+            "progress_total",
+            "error",
+            "attempts",
+            "max_attempts",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "finished_at",
+        )
+    }
+    lifecycle["error"] = _safe_factor_research_error(lifecycle.get("error"))
+    request = {
+        key: payload.get(key)
+        for key in (
+            "research_task_id",
+            "research_direction",
+            "candidates_per_round",
+            "rounds",
+        )
+        if key in payload
+    }
+    terminal_result = public_result if public_result else None
+    return {
+        "job": lifecycle,
+        "request": request,
+        "progress": {
+            "current": int(job.get("progress_current") or 0),
+            "total": int(job.get("progress_total") or 0),
+        },
+        "factor_research": {
+            "run_id": public_result.get("run_id"),
+            "status": public_result.get("status") or job.get("status"),
+            "counts": public_result.get("counts") or {},
+            "status_counts": public_result.get("status_counts") or {},
+            "result": terminal_result
+            if job.get("status")
+            in {"COMPLETED", "PARTIAL_COMPLETED", "CANCELLED"}
+            else None,
+            "artifacts": public_result.get("artifacts") or [],
+        },
+    }
+
+
+@app.post("/api/factor-research/runs", dependencies=[Depends(_authorized)])
+async def create_factor_research_run(payload: FactorResearchRunRequest) -> dict[str, Any]:
+    task = store.research_task(payload.research_task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Research task not found")
+    try:
+        readiness = research_manager.readiness(payload.research_task_id)
+    except (KeyError, RuntimeError, ValueError, OSError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if not readiness.get("runnable"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Research task is not ready for factor research",
+                "blockers": readiness.get("blockers") or [],
+            },
+        )
+    job = store.enqueue_system_job(
+        job_id=f"job-factor-research-{uuid.uuid4().hex[:12]}",
+        queue="factor-research",
+        job_type="factor_research",
+        payload=payload.model_dump(mode="json"),
+        priority=50,
+        resource_group="factor-research",
+        max_workers=1,
+        progress_total=payload.candidates_per_round * payload.rounds,
+        max_attempts=1,
+    )
+    store.append_event(
+        "action",
+        "FACTOR_RESEARCH_QUEUED",
+        "因子研究任务已进入独立队列",
+        f"{job['job_id']} · task={payload.research_task_id}",
+        payload={
+            "job_id": job["job_id"],
+            "research_task_id": payload.research_task_id,
+            "queue": "factor-research",
+            "candidates_per_round": payload.candidates_per_round,
+            "rounds": payload.rounds,
+        },
+    )
+    return {"created": True, **_factor_research_job_view(job)}
+
+
+@app.get("/api/factor-research/runs/{job_id}", dependencies=[Depends(_authorized)])
+async def factor_research_run(job_id: str) -> dict[str, Any]:
+    try:
+        job = store.system_job(job_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="Factor research job not found") from error
+    if job.get("job_type") != "factor_research":
+        raise HTTPException(status_code=404, detail="Factor research job not found")
+    return _factor_research_job_view(job)
 
 
 @app.get("/api/jobs", dependencies=[Depends(_authorized)])

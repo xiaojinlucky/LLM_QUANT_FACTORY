@@ -33,7 +33,14 @@ def _parser() -> argparse.ArgumentParser:
         "factor-research", help="run the bounded single-researcher factor discovery MVP"
     )
     factor_research.add_argument("research_direction", help="research direction for the Researcher")
-    factor_research.add_argument("--candidate-count", type=int, default=4)
+    factor_research.add_argument(
+        "--candidates-per-round",
+        "--candidate-count",
+        dest="candidates_per_round",
+        type=int,
+        default=4,
+        help="每轮最多生成的新候选数；--candidate-count 为兼容旧 CLI 的别名",
+    )
     factor_research.add_argument("--rounds", type=int, default=3)
     factor_research.add_argument(
         "--data-path",
@@ -71,7 +78,7 @@ def main() -> None:
     elif args.command == "factor-research":
         summary = run_factor_research(
             args.research_direction,
-            candidate_count=args.candidate_count,
+            candidates_per_round=args.candidates_per_round,
             rounds=args.rounds,
             data_path=args.data_path,
             output_dir=args.output_dir,

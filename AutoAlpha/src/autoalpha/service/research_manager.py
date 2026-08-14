@@ -9,6 +9,7 @@ from typing import Any
 from autoalpha.config import ResearchConfig
 from autoalpha.data.execution_basis import inspect_execution_data_basis
 from autoalpha.data.workspace import inspect_data_workspace
+from autoalpha.service.evaluator import PriceVolumeEvaluator
 from autoalpha.service.research_protocol import (
     panel_validation_fold_capacity,
     protocol_blockers,
@@ -134,6 +135,34 @@ class ResearchTaskManager:
                 "end": protocol.get("holdout_end"),
                 "feedback": "categorical_only",
             },
+        }
+
+    def factor_research_context(self, task_id: str) -> dict[str, Any]:
+        """Build the bounded factor-research context from one ResearchTask.
+
+        This is deliberately a context adapter, not another run manager. The
+        task remains the source of truth for its data path, snapshot and public
+        exploration/validation split; the global TOML only supplies the base
+        configuration that ``task_research_config`` specializes.
+        """
+
+        task = self.store.research_task(task_id)
+        if task is None:
+            raise KeyError(f"Research task not found: {task_id}")
+        readiness = self.readiness(task_id)
+        if not readiness["runnable"]:
+            raise RuntimeError("；".join(readiness["blockers"]))
+        protocol = task.get("protocol") or {}
+        if not protocol:
+            raise RuntimeError("Research task has no task-specific research protocol")
+        base = ResearchConfig.from_toml(self.config_path)
+        config = task_research_config(base, protocol, task_id=task_id)
+        evaluator = PriceVolumeEvaluator(Path(task["data_path"]), config=config)
+        return {
+            "task": task,
+            "readiness": readiness,
+            "config": config,
+            "evaluator": evaluator,
         }
 
     async def start(self, task_id: str) -> dict[str, Any]:

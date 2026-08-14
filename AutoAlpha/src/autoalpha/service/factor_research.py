@@ -13,9 +13,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import uuid
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
@@ -50,7 +51,7 @@ class FactorResearcher(Protocol):
     def propose_batch(
         self,
         research_direction: str,
-        candidate_count: int,
+        candidates_per_round: int,
         round_number: int,
         context: dict[str, Any],
     ) -> Sequence[Mapping[str, Any]]: ...
@@ -67,23 +68,24 @@ class FactorResearcher(Protocol):
 
 @dataclass(frozen=True)
 class FactorResearchBudget:
-    candidate_count: int = 4
+    candidates_per_round: int = 4
     rounds: int = 3
     maximum_repairs_per_candidate: int = 1
     maximum_llm_calls: int | None = None
     maximum_candidate_evaluations: int | None = None
 
     def __post_init__(self) -> None:
-        if not 1 <= self.candidate_count <= 100:
-            raise ValueError("candidate_count must be between 1 and 100")
+        if not 1 <= self.candidates_per_round <= 100:
+            raise ValueError("candidates_per_round must be between 1 and 100")
         if not 1 <= self.rounds <= 20:
             raise ValueError("rounds must be between 1 and 20")
         if self.maximum_repairs_per_candidate != 1:
             raise ValueError("MVP supports exactly one repair per candidate")
+        total_candidates = self.candidates_per_round * self.rounds
         default_calls = (
-            self.candidate_count * (1 + self.maximum_repairs_per_candidate) + self.rounds + 1
+            total_candidates * (1 + self.maximum_repairs_per_candidate) + self.rounds + 1
         )
-        default_evaluations = self.candidate_count * (1 + self.maximum_repairs_per_candidate)
+        default_evaluations = total_candidates * (1 + self.maximum_repairs_per_candidate)
         if self.maximum_llm_calls is not None and self.maximum_llm_calls < 1:
             raise ValueError("maximum_llm_calls must be positive")
         if (
@@ -106,8 +108,9 @@ class FactorResearchBudget:
 
     def to_dict(self) -> dict[str, int]:
         return {
-            "candidate_count": self.candidate_count,
+            "candidates_per_round": self.candidates_per_round,
             "rounds": self.rounds,
+            "total_candidates": self.candidates_per_round * self.rounds,
             "maximum_repairs_per_candidate": self.maximum_repairs_per_candidate,
             "maximum_llm_calls": int(self.maximum_llm_calls or 0),
             "maximum_candidate_evaluations": int(self.maximum_candidate_evaluations or 0),
@@ -168,7 +171,7 @@ class CompatibleChatResearcher:
     def propose_batch(
         self,
         research_direction: str,
-        candidate_count: int,
+        candidates_per_round: int,
         round_number: int,
         context: dict[str, Any],
     ) -> Sequence[Mapping[str, Any]]:
@@ -180,7 +183,7 @@ class CompatibleChatResearcher:
             self.client.propose_batch(
                 memories,
                 round_number,
-                batch_size=min(candidate_count, 5),
+                batch_size=min(candidates_per_round, 5),
                 data_context={"research_direction": research_direction, **context},
             )
         )
@@ -241,19 +244,25 @@ class CompatibleChatResearcher:
 
 def run_factor_research(
     research_direction: str,
-    candidate_count: int = 4,
+    candidates_per_round: int | None = None,
     rounds: int = 3,
     *,
+    candidate_count: int | None = None,
     researcher: FactorResearcher | Any | None = None,
     evaluator: PriceVolumeEvaluator | Any | None = None,
     store: ServiceStore | Any | None = None,
     registry: FactorRegistry | None = None,
     output_dir: Path | None = None,
+    artifact_root: Path | None = None,
     data_path: Path | None = None,
+    source_task_id: str | None = None,
+    research_context: Mapping[str, Any] | None = None,
     maximum_repairs_per_candidate: int = 1,
     maximum_llm_calls: int | None = None,
     maximum_candidate_evaluations: int | None = None,
     correlation_threshold: float = _DEFAULT_CORRELATION_THRESHOLD,
+    progress_callback: Callable[[int, int, Mapping[str, Any]], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Run the bounded Alpha Factor Discovery MVP and write two summaries.
 
@@ -267,8 +276,12 @@ def run_factor_research(
         raise ValueError("research_direction cannot be empty")
     if not 0.0 < correlation_threshold <= 1.0:
         raise ValueError("correlation_threshold must be in (0, 1]")
+    resolved_candidates_per_round = _resolve_candidates_per_round(
+        candidates_per_round,
+        candidate_count,
+    )
     budget = FactorResearchBudget(
-        candidate_count=candidate_count,
+        candidates_per_round=resolved_candidates_per_round,
         rounds=rounds,
         maximum_repairs_per_candidate=maximum_repairs_per_candidate,
         maximum_llm_calls=maximum_llm_calls,
@@ -280,7 +293,12 @@ def run_factor_research(
     resolved_evaluator = evaluator or _default_evaluator(resolved_store, data_path=data_path)
     resolved_researcher = researcher or _default_researcher(resolved_store)
     resolved_registry = registry or FactorRegistry(runtime_root / "factor-registry")
-    artifact_dir = Path(output_dir or runtime_root / "factor-research" / run_id)
+    resolved_source_task_id = source_task_id or f"factor-research:{run_id}"
+    artifact_dir = (
+        Path(artifact_root) / run_id
+        if artifact_root is not None
+        else Path(output_dir or runtime_root / "factor-research" / run_id)
+    )
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     run_budget = _RunBudget()
@@ -292,15 +310,19 @@ def run_factor_research(
     generation_errors: list[str] = []
     ordinal = 0
     candidate_generation_complete = False
+    total_candidates = budget.candidates_per_round * budget.rounds
 
     for round_number in range(1, budget.rounds + 1):
-        if len(candidates) >= budget.candidate_count:
+        if len(candidates) >= total_candidates:
             candidate_generation_complete = True
+            break
+        if _cancel_requested(cancel_requested):
+            run_budget.exhausted.append("cancel_requested")
             break
         if run_budget.llm_calls >= int(budget.maximum_llm_calls or 0):
             run_budget.exhausted.append("maximum_llm_calls")
             break
-        remaining = budget.candidate_count - len(candidates)
+        remaining = min(budget.candidates_per_round, total_candidates - len(candidates))
         context = _research_context(
             direction,
             round_number,
@@ -324,6 +346,9 @@ def run_factor_research(
             generation_errors.append(f"round_{round_number}:empty_proposal_batch")
             continue
         for raw in raw_batch[:remaining]:
+            if _cancel_requested(cancel_requested):
+                run_budget.exhausted.append("cancel_requested")
+                break
             ordinal += 1
             try:
                 outcome = _process_candidate(
@@ -336,7 +361,7 @@ def run_factor_research(
                     evaluator=resolved_evaluator,
                     store=resolved_store,
                     registry=resolved_registry,
-                    source_task_id=f"factor-research:{run_id}",
+                    source_task_id=resolved_source_task_id,
                     seen_hashes=seen_hashes,
                     existing_factors=[*existing_factors, *kept_factors],
                     budget=budget,
@@ -355,7 +380,13 @@ def run_factor_research(
                     candidate_id=f"{run_id}-candidate-{ordinal:02d}",
                 )
                 try:
-                    outcome = _finish_candidate(resolved_store, run_id, ordinal, outcome)
+                    outcome = _finish_candidate(
+                        resolved_store,
+                        run_id,
+                        ordinal,
+                        outcome,
+                        source_task_id=resolved_source_task_id,
+                    )
                 except Exception as finish_error:
                     generation_errors.append(
                         f"candidate_{ordinal}_finalize:{type(finish_error).__name__}"
@@ -364,15 +395,33 @@ def run_factor_research(
             if outcome.status == KEEP and outcome.factor is not None:
                 kept_factors.append(outcome.factor)
                 kept_outcomes.append(outcome)
-            if len(candidates) >= budget.candidate_count:
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        len(candidates),
+                        total_candidates,
+                        {
+                            "phase": "candidate",
+                            "round": round_number,
+                            "candidate_id": outcome.candidate_id,
+                            "candidate_status": outcome.status,
+                        },
+                    )
+                except Exception as error:
+                    generation_errors.append(f"progress_callback:{type(error).__name__}")
+            if len(candidates) >= total_candidates:
                 break
-        if len(candidates) >= budget.candidate_count:
+        if len(candidates) >= total_candidates:
             candidate_generation_complete = True
             break
 
-    if len(candidates) >= budget.candidate_count:
+    if len(candidates) >= total_candidates:
         candidate_generation_complete = True
-    if not candidate_generation_complete and len(candidates) < budget.candidate_count:
+    if (
+        not candidate_generation_complete
+        and len(candidates) < total_candidates
+        and "cancel_requested" not in run_budget.exhausted
+    ):
         run_budget.exhausted.append("candidate_generation_rounds")
 
     portfolio = _evaluate_simple_portfolio(resolved_evaluator, kept_factors, kept_outcomes)
@@ -399,6 +448,7 @@ def run_factor_research(
             else "PARTIAL_COMPLETED"
         ),
         "research_direction": direction,
+        "research_context": _json_safe(dict(research_context or {})),
         "budgets": budget.to_dict(),
         "usage": {
             "llm_calls": run_budget.llm_calls,
@@ -407,7 +457,9 @@ def run_factor_research(
             "exhausted": sorted(set(run_budget.exhausted)),
         },
         "counts": {
-            "requested": budget.candidate_count,
+            "requested": total_candidates,
+            "candidates_per_round": budget.candidates_per_round,
+            "rounds": budget.rounds,
             "proposed": len(candidates),
             "keep": counts[KEEP],
             "rejected": sum(counts[status] for status in _REJECTED_STATUSES),
@@ -498,7 +550,13 @@ def _process_candidate(
                 run_budget=run_budget,
             )
             if repaired is None:
-                return _finish_candidate(store, run_id, ordinal, outcome)
+                return _finish_candidate(
+                    store,
+                    run_id,
+                    ordinal,
+                    outcome,
+                    source_task_id=source_task_id,
+                )
             if outcome.factor is not None and parent_factor_id is None:
                 parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
@@ -521,7 +579,13 @@ def _process_candidate(
             outcome.status = DUPLICATE
             outcome.reason = "canonical_expression_duplicate"
             outcome.duplicate_of = factor.factor_id
-            return _finish_candidate(store, run_id, ordinal, outcome)
+            return _finish_candidate(
+                store,
+                run_id,
+                ordinal,
+                outcome,
+                source_task_id=source_task_id,
+            )
         seen_hashes.add(factor.expression.expression_hash)
 
         try:
@@ -538,7 +602,13 @@ def _process_candidate(
                 run_budget=run_budget,
             )
             if repaired is None:
-                return _finish_candidate(store, run_id, ordinal, outcome)
+                return _finish_candidate(
+                    store,
+                    run_id,
+                    ordinal,
+                    outcome,
+                    source_task_id=source_task_id,
+                )
             if outcome.factor is not None and parent_factor_id is None:
                 parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
@@ -549,7 +619,13 @@ def _process_candidate(
             run_budget.exhausted.append("maximum_candidate_evaluations")
             outcome.status = BUDGET_EXHAUSTED
             outcome.reason = "maximum_candidate_evaluations"
-            return _finish_candidate(store, run_id, ordinal, outcome)
+            return _finish_candidate(
+                store,
+                run_id,
+                ordinal,
+                outcome,
+                source_task_id=source_task_id,
+            )
 
         run_budget.candidate_evaluations += 1
         try:
@@ -566,7 +642,13 @@ def _process_candidate(
                 run_budget=run_budget,
             )
             if repaired is None:
-                return _finish_candidate(store, run_id, ordinal, outcome)
+                return _finish_candidate(
+                    store,
+                    run_id,
+                    ordinal,
+                    outcome,
+                    source_task_id=source_task_id,
+                )
             if outcome.factor is not None and parent_factor_id is None:
                 parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
@@ -584,7 +666,13 @@ def _process_candidate(
                 run_budget=run_budget,
             )
             if repaired is None:
-                return _finish_candidate(store, run_id, ordinal, outcome)
+                return _finish_candidate(
+                    store,
+                    run_id,
+                    ordinal,
+                    outcome,
+                    source_task_id=source_task_id,
+                )
             if outcome.factor is not None and parent_factor_id is None:
                 parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
@@ -607,7 +695,13 @@ def _process_candidate(
                 run_budget=run_budget,
             )
             if repaired is None:
-                return _finish_candidate(store, run_id, ordinal, outcome)
+                return _finish_candidate(
+                    store,
+                    run_id,
+                    ordinal,
+                    outcome,
+                    source_task_id=source_task_id,
+                )
             if outcome.factor is not None and parent_factor_id is None:
                 parent_factor_id = outcome.factor.factor_id
             repair_count = outcome.repair_count
@@ -624,7 +718,13 @@ def _process_candidate(
             outcome.status = DUPLICATE
             outcome.reason = "behavior_correlation_duplicate"
             outcome.duplicate_of = behavior_duplicate
-            return _finish_candidate(store, run_id, ordinal, outcome)
+            return _finish_candidate(
+                store,
+                run_id,
+                ordinal,
+                outcome,
+                source_task_id=source_task_id,
+            )
 
         outcome.status = KEEP
         outcome.reason = "validation_core_metrics_passed"
@@ -639,7 +739,13 @@ def _process_candidate(
             run_id=run_id,
             direction=direction,
         )
-        return _finish_candidate(store, run_id, ordinal, outcome)
+        return _finish_candidate(
+            store,
+            run_id,
+            ordinal,
+            outcome,
+            source_task_id=source_task_id,
+        )
 
 
 def _try_repair(
@@ -743,7 +849,12 @@ def _persist_keep(
 
 
 def _finish_candidate(
-    store: Any, run_id: str, ordinal: int, outcome: _CandidateOutcome
+    store: Any,
+    run_id: str,
+    ordinal: int,
+    outcome: _CandidateOutcome,
+    *,
+    source_task_id: str | None = None,
 ) -> _CandidateOutcome:
     metrics = {
         "research_status": outcome.status,
@@ -756,7 +867,14 @@ def _finish_candidate(
         "parent_factor_id": outcome.parent_factor_id,
     }
     if outcome.status != KEEP:
-        _persist_rejected_history(store, run_id, ordinal, outcome, metrics)
+        _persist_rejected_history(
+            store,
+            run_id,
+            ordinal,
+            outcome,
+            metrics,
+            source_task_id=source_task_id,
+        )
     finish = getattr(store, "finish_iteration", None)
     if callable(finish):
         finish(
@@ -783,6 +901,8 @@ def _persist_rejected_history(
     ordinal: int,
     outcome: _CandidateOutcome,
     metrics: dict[str, Any],
+    *,
+    source_task_id: str | None = None,
 ) -> None:
     """Keep a small rejected-candidate record without polluting KEEP factors."""
 
@@ -808,7 +928,7 @@ def _persist_rejected_history(
         upsert(
             factor_id=rejected_id,
             source_iteration=ordinal,
-            source_task_id=f"factor-research:{run_id}",
+            source_task_id=source_task_id or f"factor-research:{run_id}",
             proposal=outcome.proposal,
             metrics=_json_safe(rejected_metrics),
             status=REJECTED,
@@ -1238,6 +1358,161 @@ def _expression_fields(expression: Expression) -> set[str]:
     return fields
 
 
+def _resolve_candidates_per_round(
+    candidates_per_round: int | None,
+    candidate_count: int | None,
+) -> int:
+    if (
+        candidates_per_round is not None
+        and candidate_count is not None
+        and int(candidates_per_round) != int(candidate_count)
+    ):
+        raise ValueError(
+            "candidates_per_round and legacy candidate_count must match when both are set"
+        )
+    value = candidates_per_round if candidates_per_round is not None else candidate_count
+    return int(value if value is not None else 4)
+
+
+def _cancel_requested(callback: Callable[[], bool] | None) -> bool:
+    if callback is None:
+        return False
+    try:
+        return bool(callback())
+    except Exception:
+        return False
+
+
+_WEB_FORBIDDEN_KEYS = {
+    "api_key",
+    "apikey",
+    "secret",
+    "token",
+    "password",
+    "raw_provider_secret",
+    "raw_system_prompt",
+    "system_prompt",
+    "prompt",
+    "data_path",
+    "output_dir",
+    "absolute_path",
+}
+
+
+def _web_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _web_safe(item)
+            for key, item in value.items()
+            if str(key).casefold() not in _WEB_FORBIDDEN_KEYS
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_web_safe(item) for item in value]
+    if isinstance(value, Path):
+        return "<redacted-path>"
+    if isinstance(value, str):
+        if re.search(r"\bsk-[A-Za-z0-9_-]+\b", value):
+            return re.sub(r"\bsk-[A-Za-z0-9_-]+\b", "<redacted-secret>", value)
+        if re.search(r"(?:[A-Za-z]:[\\/]|/)(?:[^\s,;]+[\\/])*[^\s,;]*", value):
+            return re.sub(
+                r"(?:[A-Za-z]:[\\/]|/)(?:[^\s,;]+[\\/])*[^\s,;]*",
+                "<redacted-path>",
+                value,
+            )
+    return _json_safe(value)
+
+
+def build_factor_research_web_result(
+    summary: Mapping[str, Any],
+    *,
+    artifact_prefix: str,
+) -> dict[str, Any]:
+    """Return the allow-listed result shape used by the Web contract.
+
+    The filesystem paths in the CLI summary intentionally remain available to
+    local callers. This adapter never copies them into the Web response.
+    """
+
+    def candidate_view(candidate: Mapping[str, Any]) -> dict[str, Any]:
+        proposal = candidate.get("proposal") or {}
+        if not isinstance(proposal, Mapping):
+            proposal = {}
+        normalized = {
+            key: _web_safe(proposal.get(key))
+            for key in (
+                "name",
+                "family",
+                "hypothesis",
+                "expected_direction",
+                "expression",
+                "expression_hash",
+                "fields",
+            )
+            if key in proposal
+        }
+        status = str(candidate.get("status") or "UNKNOWN")
+        return {
+            "candidate_id": candidate.get("candidate_id"),
+            "round": candidate.get("round"),
+            "status": status,
+            "normalized_candidate": normalized,
+            "factor_name": normalized.get("name"),
+            "hypothesis": normalized.get("hypothesis"),
+            "expression": normalized.get("expression"),
+            "fields": normalized.get("fields", []),
+            "exploration_metrics": _web_safe(candidate.get("train_metrics") or {}),
+            "public_validation_metrics": _web_safe(
+                candidate.get("validation_metrics") or {}
+            ),
+            "core_metrics": _web_safe(candidate.get("core_metrics") or {}),
+            "repair_count": int(candidate.get("repair_count") or 0),
+            "parent_lineage": candidate.get("parent_factor_id"),
+            "duplicate_peer": candidate.get("duplicate_of"),
+            "rejection_reason": candidate.get("reason") if status != KEEP else None,
+        }
+
+    counts = summary.get("counts") or {}
+    candidates = [
+        candidate_view(item)
+        for item in (summary.get("candidates") or [])
+        if isinstance(item, Mapping)
+    ]
+    context = summary.get("research_context") or {}
+    return {
+        "protocol": "AUTOALPHA_FACTOR_RESEARCH_WEB_RESULT_V1",
+        "run_id": summary.get("run_id"),
+        "status": summary.get("status"),
+        "research_direction": summary.get("research_direction"),
+        "research_context": _web_safe(context),
+        "counts": _web_safe(counts),
+        "status_counts": _web_safe(counts.get("by_status") or {}),
+        "candidates": candidates,
+        "top_factors": [
+            item
+            for item in candidates
+            if item.get("status") == KEEP
+        ][:5],
+        "simple_portfolio": _web_safe(summary.get("simple_portfolio") or {}),
+        "llm_conclusion": _web_safe(str(summary.get("llm_conclusion") or "")),
+        "production_promotion": {
+            "allowed": False,
+            "reason": "MVP research admission is separate from production promotion",
+        },
+        "artifacts": [
+            {
+                "artifact_id": f"{artifact_prefix}/research_summary.json",
+                "name": "research_summary.json",
+                "media_type": "application/json",
+            },
+            {
+                "artifact_id": f"{artifact_prefix}/research_summary.md",
+                "name": "research_summary.md",
+                "media_type": "text/markdown",
+            },
+        ],
+    }
+
+
 def _run_id() -> str:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return f"factor-research-{timestamp}-{uuid.uuid4().hex[:8]}"
@@ -1311,7 +1586,9 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
         f"- 运行状态：`{summary['status']}`",
         f"- 研究方向：{summary['research_direction']}",
         (
-            f"- 候选：{counts['proposed']} / {counts['requested']}；"
+            f"- 候选：{counts['proposed']} / {counts['requested']}（每轮 "
+            f"{counts.get('candidates_per_round', counts['requested'])} × "
+            f"{counts.get('rounds', 1)}）；"
             f"KEEP：{counts['keep']}；拒绝：{counts['rejected']}"
         ),
         (
@@ -1319,10 +1596,11 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
             f"候选评价：{summary['usage']['candidate_evaluations']}；"
             f"修复：{summary['usage']['repairs']}"
         ),
+        "- 评价语义：探索期 → 公开验证期；不表示生产晋级。",
         "",
         "## 候选结果",
         "",
-        "| 候选 | 状态 | 验证 Sharpe | 验证年化 | 覆盖率 | 原因 |",
+        "| 候选 | 状态 | 公开验证 Sharpe | 公开验证年化 | 覆盖率 | 原因 |",
         "| --- | --- | ---: | ---: | ---: | --- |",
     ]
     for candidate in summary["candidates"]:
@@ -1396,6 +1674,7 @@ def _run_async(awaitable: Any) -> Any:
 
 __all__ = [
     "BUDGET_EXHAUSTED",
+    "build_factor_research_web_result",
     "CompatibleChatResearcher",
     "DUPLICATE",
     "FactorResearchBudget",
