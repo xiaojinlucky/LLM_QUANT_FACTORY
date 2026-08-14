@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoAlpha 因子研究</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260717-recent-protocol-v1">
+  <link rel="stylesheet" href="/static/platform_header.css?v=20260718-v2">
+  <link rel="stylesheet" href="/static/factor_research.css?v=20260814-factor-research-ui-v1">
+</head>
+<body>
+  <header class="app-header">
+    <div class="identity">
+      <h1>因子研究</h1>
+      <a class="workspace-task-link" id="taskIdentity" href="/research-tasks">选择研究任务</a>
+    </div>
+    <div class="header-actions">
+      <a class="button" id="returnTaskLink" href="/research-tasks">任务详情</a>
+    </div>
+  </header>
+  <script src="/static/platform_header.js?v=20260718-quant-v1"></script>
+
+  <main class="factor-research-shell" id="factorResearchApp">
+    <section class="panel fr-context-panel" id="contextPanel" hidden>
+      <div class="fr-context-heading">
+        <div>
+          <h2 id="contextTaskName">--</h2>
+        </div>
+        <span class="fr-status-pill neutral" id="contextTaskStatus">--</span>
+      </div>
+      <div class="fr-context-grid">
+        <div><span>任务 ID</span><code id="contextTaskId">--</code></div>
+        <div><span>市场</span><strong id="contextMarket">--</strong></div>
+        <div><span>数据快照</span><code id="contextSnapshot">--</code></div>
+        <div><span>研究协议</span><strong id="contextReadiness">--</strong></div>
+      </div>
+    </section>
+
+    <section class="panel fr-entry-panel" id="entryPanel">
+      <div class="fr-panel-heading">
+        <div>
+          <h2>发起因子研究</h2>
+        </div>
+      </div>
+      <form id="launchForm" class="fr-launch-form">
+        <label class="fr-direction-field">
+          研究方向
+          <textarea id="researchDirection" maxlength="500" required placeholder="例如：探索量价背离后的短期反转信号"></textarea>
+        </label>
+        <div class="fr-budget-row" aria-label="研究预算">
+          <div><span>每轮候选</span><strong id="candidatesPerRound">4</strong></div>
+          <div><span>研究轮次</span><strong id="rounds">3</strong></div>
+          <div><span>最大候选</span><strong id="candidateBudget">12</strong></div>
+        </div>
+        <div class="fr-entry-actions">
+          <span class="fr-form-state" id="entryState">研究会绑定当前 ResearchTask</span>
+          <button class="button primary" id="startResearch" type="submit">开始因子研究</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel fr-run-panel" id="runPanel" hidden>
+      <div class="fr-run-heading">
+        <div class="fr-run-title">
+          <h2 id="runTitle">因子研究运行</h2>
+          <div class="fr-run-identifiers"><code id="runId">--</code><span id="runDirection">--</span></div>
+        </div>
+        <div class="fr-run-actions">
+          <span class="fr-status-pill neutral" id="runStatus">--</span>
+          <button class="button danger" id="cancelRun" type="button" hidden>取消运行</button>
+          <a class="button" id="runTaskLink" href="/research-tasks">任务详情</a>
+        </div>
+      </div>
+
+      <div class="fr-request-strip">
+        <div><span>研究方向</span><strong id="requestDirection">--</strong></div>
+        <div><span>候选预算</span><strong id="requestBudget">--</strong></div>
+      </div>
+
+      <div class="fr-running-state" id="runningState" hidden>
+        <div class="fr-progress-heading"><span>公开进度</span><strong id="progressValue">0 / 0</strong></div>
+        <div class="fr-progress-track" aria-hidden="true"><i id="progressBar"></i></div>
+        <div class="fr-running-foot"><span id="runningLifecycle">--</span><span>候选证据将在研究结束后显示</span></div>
+      </div>
+
+      <div class="fr-terminal-state" id="terminalState" hidden>
+        <div class="fr-terminal-summary" id="terminalSummary"></div>
+        <div class="fr-info-note" id="admissionNote">仅完成研究准入 · 尚未进行生产晋级</div>
+        <div class="fr-no-keep-note" id="noKeepNote" hidden>本次研究没有候选进入研究准入。</div>
+        <div class="fr-terminal-error" id="terminalError" hidden></div>
+
+        <div class="fr-results-toolbar" id="resultsToolbar" hidden>
+          <label>轮次<select id="roundFilter"><option value="all">全部轮次</option></select></label>
+          <label>状态<select id="statusFilter"><option value="all">全部状态</option></select></label>
+          <label class="fr-search-field">因子名<input id="candidateSearch" type="search" placeholder="搜索因子名"></label>
+        </div>
+
+        <div class="fr-results-grid" id="resultsGrid" hidden>
+          <section class="fr-candidate-panel panel" aria-labelledby="candidateTableTitle">
+            <div class="fr-subpanel-heading">
+              <div><h3 id="candidateTableTitle">候选比较</h3></div>
+              <span id="candidateCountLabel">--</span>
+            </div>
+            <div class="fr-table-wrap">
+              <table class="fr-candidate-table">
+                <thead>
+                  <tr>
+                    <th>状态</th>
+                    <th>因子名</th>
+                    <th>轮次</th>
+                    <th>修复</th>
+                    <th class="numeric">Rank IC</th>
+                    <th class="numeric">Sharpe</th>
+                    <th class="numeric">年化收益</th>
+                    <th class="numeric">最大回撤</th>
+                    <th class="numeric">换手</th>
+                    <th class="numeric">覆盖率</th>
+                  </tr>
+                </thead>
+                <tbody id="candidateRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="fr-evidence-panel panel" id="evidencePanel" hidden aria-labelledby="evidenceTitle">
+            <div class="fr-evidence-heading">
+              <div><h3 id="evidenceTitle">选择候选</h3></div>
+              <button class="icon-button" id="closeEvidence" type="button" aria-label="关闭证据面板" title="关闭证据面板">×</button>
+            </div>
+            <div class="fr-evidence-spine" id="evidenceSpine"></div>
+          </section>
+        </div>
+
+        <div class="fr-empty-result" id="emptyResult" hidden>当前响应没有可供复核的候选证据。</div>
+      </div>
+    </section>
+
+    <section class="panel fr-entry-blocked" id="entryBlocked" hidden>
+      <h2>需要先选择研究任务</h2>
+      <div>请从 ResearchTask 详情进入因子研究。</div>
+      <a class="button" href="/research-tasks">打开任务总表</a>
+    </section>
+  </main>
+
+  <div id="toast" role="status"></div>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="/static/factor_research.js?v=20260814-factor-research-ui-v1"></script>
+</body>
+</html>
