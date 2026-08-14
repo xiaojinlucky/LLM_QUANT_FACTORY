@@ -132,6 +132,9 @@ function renderDetail(taskId) {
   const workspaceLink = document.getElementById("openCurrentResearch");
   workspaceLink.hidden = false;
   workspaceLink.href = `/research/${encodeURIComponent(task.task_id)}`;
+  const factorResearchLink = document.getElementById("openFactorResearch");
+  factorResearchLink.hidden = false;
+  factorResearchLink.href = `/factor-research?research_task_id=${encodeURIComponent(task.task_id)}`;
   if (window.lucide) window.lucide.createIcons();
 }
 

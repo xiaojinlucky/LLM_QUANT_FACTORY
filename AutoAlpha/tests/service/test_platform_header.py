@@ -18,6 +18,7 @@ PLATFORM_PAGES = (
     "data_center.html",
     "settings.html",
     "system_guide.html",
+    "factor_research.html",
 )
 
 

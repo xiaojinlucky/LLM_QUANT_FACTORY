@@ -1565,6 +1565,11 @@ async def research_task_detail_page(task_id: str) -> FileResponse:
     return FileResponse(PACKAGE_ROOT / "static/research_tasks.html")
 
 
+@app.get("/factor-research", include_in_schema=False)
+async def factor_research_page() -> FileResponse:
+    return FileResponse(PACKAGE_ROOT / "static/factor_research.html")
+
+
 @app.get("/llm-team", include_in_schema=False)
 async def llm_team_page() -> FileResponse:
     return FileResponse(PACKAGE_ROOT / "static/llm_team.html")
