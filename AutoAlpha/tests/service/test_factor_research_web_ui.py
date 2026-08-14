@@ -65,6 +65,31 @@ def test_candidate_table_and_evidence_share_core_metrics_and_exploration_allowli
     assert "turnover" not in exploration
 
 
+def test_candidate_selection_uses_candidate_instance_index_not_factor_identity() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    assert "selectedCandidateIndex" in script
+    assert "selectedCandidateId" not in script
+    assert "candidateRow(candidate, index)" in script
+    assert "selectCandidate(index)" in script
+    assert "candidates[appState.selectedCandidateIndex]" in script
+    assert "candidateIndexExists(appState.selectedCandidateIndex, candidates)" in script
+
+
+def test_run_task_identity_is_canonicalized_from_job_request() -> None:
+    script = SCRIPT.read_text(encoding="utf-8")
+
+    assert "const runTaskId = String(appState.jobView.request?.research_task_id || \"\")" in script
+    assert "const urlTaskId = String(appState.taskId || \"\")" in script
+    assert "if (urlTaskId !== runTaskId)" in script
+    assert (
+        'history.replaceState(null, "", factorResearchUrl(appState.taskId, appState.jobId));'
+        in script
+    )
+    assert 'String(appState.task.task_id || "") !== runTaskId' in script
+    assert "if (appState.jobId && !appState.taskId)" not in script
+
+
 def test_dynamic_research_content_is_rendered_without_raw_inner_html() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
 
@@ -88,3 +113,9 @@ def test_terminal_status_and_refresh_fallbacks_are_explicit() -> None:
     assert '"打开因子库继续复核"' in script
     assert '"因子库刷新失败"' in script
     assert '"打开现有因子库"' in script
+    assert "/api/jobs/${encodeURIComponent(refreshJob.jobId)}/logs?limit=1" in script
+    assert "/api/jobs?queue=system&limit=200" not in script
+    assert "data.job?.status" in script
+    assert 'status: "UNKNOWN"' in script
+    assert "refreshJob.retryCount" in script
+    assert "refreshJob.retryable" in script

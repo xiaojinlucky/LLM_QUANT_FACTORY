@@ -46,7 +46,7 @@ const appState = {
   taskId: null,
   jobId: null,
   jobView: null,
-  selectedCandidateId: null,
+  selectedCandidateIndex: null,
   refreshJob: null,
   pollTimer: null,
   refreshPollTimer: null,
@@ -76,18 +76,13 @@ async function initializeFactorResearch() {
     return;
   }
   try {
-    if (appState.jobId && !appState.taskId) {
-      const run = await api(`/api/factor-research/runs/${encodeURIComponent(appState.jobId)}`);
-      appState.jobView = run;
-      appState.taskId = run.request?.research_task_id || "";
-    }
-    if (!appState.taskId) throw new Error("因子研究运行没有关联 ResearchTask");
-    appState.task = await api(`/api/research-tasks/${encodeURIComponent(appState.taskId)}`);
-    renderTaskContext();
-    updateTaskLinks();
     if (appState.jobId) {
       await loadFactorResearchRun();
     } else {
+      if (!appState.taskId) throw new Error("因子研究运行没有关联 ResearchTask");
+      appState.task = await api(`/api/research-tasks/${encodeURIComponent(appState.taskId)}`);
+      renderTaskContext();
+      updateTaskLinks();
       renderLaunchState();
     }
   } catch (error) {
@@ -135,8 +130,15 @@ async function loadFactorResearchRun() {
   if (!appState.jobId) return;
   try {
     appState.jobView = await api(`/api/factor-research/runs/${encodeURIComponent(appState.jobId)}`);
-    if (!appState.task && appState.jobView.request?.research_task_id) {
-      appState.taskId = appState.jobView.request.research_task_id;
+    const runTaskId = String(appState.jobView.request?.research_task_id || "");
+    if (!runTaskId) throw new Error("因子研究运行没有关联 ResearchTask");
+    const urlTaskId = String(appState.taskId || "");
+    if (urlTaskId !== runTaskId) {
+      appState.taskId = runTaskId;
+      history.replaceState(null, "", factorResearchUrl(appState.taskId, appState.jobId));
+    }
+    if (!appState.task || String(appState.task.task_id || "") !== runTaskId) {
+      appState.taskId = runTaskId;
       appState.task = await api(`/api/research-tasks/${encodeURIComponent(appState.taskId)}`);
       renderTaskContext();
       updateTaskLinks();
@@ -277,8 +279,8 @@ function renderTerminalState(status, result, error) {
   document.getElementById("emptyResult").hidden = showCandidates || shouldShowError;
   if (showCandidates) {
     prepareCandidateFilters(candidates);
-    if (!appState.selectedCandidateId || !candidates.some(candidate => String(candidate.candidate_id) === String(appState.selectedCandidateId))) {
-      appState.selectedCandidateId = String(candidates[0].candidate_id || "");
+    if (!candidateIndexExists(appState.selectedCandidateIndex, candidates)) {
+      appState.selectedCandidateIndex = 0;
     }
     renderCandidateTable();
     renderEvidence();
@@ -348,11 +350,11 @@ function prepareCandidateFilters(candidates) {
 }
 
 function renderCandidateTable() {
-  const candidates = currentCandidates();
+  const candidateEntries = currentCandidateEntries();
   const round = document.getElementById("roundFilter").value;
   const status = document.getElementById("statusFilter").value;
   const query = document.getElementById("candidateSearch").value.trim().toLowerCase();
-  const filtered = candidates.filter(candidate => {
+  const filtered = candidateEntries.filter(({ candidate }) => {
     const candidateRound = String(finiteCount(candidate.round) ?? "");
     const candidateStatus = String(candidate.status || "UNKNOWN");
     const factorName = String(candidate.factor_name || candidate.normalized_candidate?.name || "");
@@ -360,7 +362,7 @@ function renderCandidateTable() {
       && (status === "all" || candidateStatus === status)
       && (!query || factorName.toLowerCase().includes(query));
   });
-  setText("candidateCountLabel", `${filtered.length} / ${candidates.length}`);
+  setText("candidateCountLabel", `${filtered.length} / ${candidateEntries.length}`);
   const body = document.getElementById("candidateRows");
   if (!filtered.length) {
     const row = document.createElement("tr");
@@ -372,21 +374,21 @@ function renderCandidateTable() {
     body.replaceChildren(row);
     return;
   }
-  body.replaceChildren(...filtered.map(candidateRow));
+  body.replaceChildren(...filtered.map(({ candidate, index }) => candidateRow(candidate, index)));
 }
 
-function candidateRow(candidate) {
+function candidateRow(candidate, index) {
   const candidateId = String(candidate.candidate_id || "");
   const row = document.createElement("tr");
   row.tabIndex = 0;
   row.setAttribute("role", "button");
   row.setAttribute("aria-label", `查看候选 ${candidate.factor_name || candidateId}`);
-  row.classList.toggle("selected", candidateId === String(appState.selectedCandidateId || ""));
-  row.addEventListener("click", () => selectCandidate(candidateId));
+  row.classList.toggle("selected", index === appState.selectedCandidateIndex);
+  row.addEventListener("click", () => selectCandidate(index));
   row.addEventListener("keydown", event => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      selectCandidate(candidateId);
+      selectCandidate(index);
     }
   });
   const statusCell = document.createElement("td");
@@ -413,22 +415,26 @@ function candidateRow(candidate) {
   return row;
 }
 
-function selectCandidate(candidateId) {
-  appState.selectedCandidateId = String(candidateId || "");
+function selectCandidate(index) {
+  if (!candidateIndexExists(index, currentCandidates())) return;
+  appState.selectedCandidateIndex = index;
   renderCandidateTable();
   renderEvidence();
   if (window.innerWidth <= 860) document.getElementById("evidencePanel").scrollIntoView({ block: "start", behavior: "smooth" });
 }
 
 function closeEvidence() {
-  appState.selectedCandidateId = null;
+  appState.selectedCandidateIndex = null;
   document.getElementById("evidencePanel").hidden = true;
   document.getElementById("resultsGrid").classList.remove("has-evidence");
   renderCandidateTable();
 }
 
 function renderEvidence() {
-  const candidate = currentCandidates().find(item => String(item.candidate_id || "") === String(appState.selectedCandidateId || ""));
+  const candidates = currentCandidates();
+  const candidate = candidateIndexExists(appState.selectedCandidateIndex, candidates)
+    ? candidates[appState.selectedCandidateIndex]
+    : null;
   const panel = document.getElementById("evidencePanel");
   if (!candidate) {
     panel.hidden = true;
@@ -586,40 +592,54 @@ async function loadFactorLibraryRefresh(result) {
     appState.refreshJob = null;
     return;
   }
-  appState.refreshJob = { jobId: String(metadata.job_id), status: "QUEUED" };
-  renderEvidence();
-  try {
-    const data = await api("/api/jobs?queue=system&limit=200");
-    const job = (data.jobs || []).find(item => String(item.job_id) === String(metadata.job_id));
-    appState.refreshJob.status = job?.status || "QUEUED";
+  const jobId = String(metadata.job_id);
+  if (appState.refreshJob?.jobId === jobId) {
     renderEvidence();
-    scheduleRefreshPoll();
-  } catch (error) {
-    appState.refreshJob.status = "UNKNOWN";
-    renderEvidence();
+    return;
   }
+  appState.refreshJob = { jobId, status: "UNKNOWN", retryCount: 0, retryable: true };
+  renderEvidence();
+  await pollFactorLibraryRefresh();
 }
 
 function scheduleRefreshPoll() {
   window.clearTimeout(appState.refreshPollTimer);
-  if (!appState.refreshJob || !["QUEUED", "RUNNING"].includes(appState.refreshJob.status)) return;
+  if (!shouldPollRefresh()) return;
   appState.refreshPollTimer = window.setTimeout(async () => {
-    try {
-      const data = await api("/api/jobs?queue=system&limit=200");
-      const job = (data.jobs || []).find(item => String(item.job_id) === String(appState.refreshJob.jobId));
-      if (job) appState.refreshJob.status = job.status;
-      renderEvidence();
-      scheduleRefreshPoll();
-    } catch (error) {
-      appState.refreshJob.status = "UNKNOWN";
-      renderEvidence();
-    }
+    await pollFactorLibraryRefresh();
   }, 2200);
+}
+
+async function pollFactorLibraryRefresh() {
+  const refreshJob = appState.refreshJob;
+  if (!refreshJob) return;
+  try {
+    const data = await api(`/api/jobs/${encodeURIComponent(refreshJob.jobId)}/logs?limit=1`);
+    const rawStatus = String(data.job?.status || "UNKNOWN");
+    refreshJob.status = ["QUEUED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "BLOCKED_UNSUPPORTED"].includes(rawStatus)
+      ? rawStatus
+      : "UNKNOWN";
+    refreshJob.retryCount = 0;
+    refreshJob.retryable = false;
+  } catch (error) {
+    refreshJob.status = "UNKNOWN";
+    refreshJob.retryCount = (refreshJob.retryCount || 0) + 1;
+    refreshJob.retryable = refreshJob.retryCount < 3;
+  }
+  renderEvidence();
+  scheduleRefreshPoll();
+}
+
+function shouldPollRefresh() {
+  const refreshJob = appState.refreshJob;
+  if (!refreshJob) return false;
+  if (["QUEUED", "RUNNING"].includes(refreshJob.status)) return true;
+  return refreshJob.status === "UNKNOWN" && refreshJob.retryable === true;
 }
 
 function libraryRefreshNode() {
   const wrapper = element("div", "fr-library-status");
-  const status = appState.refreshJob?.status || "QUEUED";
+  const status = appState.refreshJob?.status || "UNKNOWN";
   if (["QUEUED", "RUNNING"].includes(status)) {
     wrapper.append(element("strong", "", "因子库刷新中"), element("div", "", "本次保留因子尚未承诺已出现在因子库。"));
     return wrapper;
@@ -646,6 +666,14 @@ function currentCandidates() {
   return Array.isArray(appState.jobView?.factor_research?.result?.candidates)
     ? appState.jobView.factor_research.result.candidates
     : [];
+}
+
+function currentCandidateEntries() {
+  return currentCandidates().map((candidate, index) => ({ candidate, index }));
+}
+
+function candidateIndexExists(index, candidates = currentCandidates()) {
+  return Number.isInteger(index) && index >= 0 && index < candidates.length;
 }
 
 function statusPill(rawStatus) {
