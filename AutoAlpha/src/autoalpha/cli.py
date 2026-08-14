@@ -6,6 +6,7 @@ from pathlib import Path
 
 from autoalpha.config import ResearchConfig
 from autoalpha.data.current_panel import inspect_current_panel
+from autoalpha.service.factor_research import run_factor_research
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -28,6 +29,25 @@ def _parser() -> argparse.ArgumentParser:
         "inspect-data", help="report price-research and institutional PIT data readiness"
     )
     inspect_data.add_argument("path", type=Path, help="partitioned parquet panel directory")
+    factor_research = subparsers.add_parser(
+        "factor-research", help="run the bounded single-researcher factor discovery MVP"
+    )
+    factor_research.add_argument("research_direction", help="research direction for the Researcher")
+    factor_research.add_argument(
+        "--candidates-per-round",
+        dest="candidates_per_round",
+        type=int,
+        default=4,
+        help="每轮最多生成的新候选数",
+    )
+    factor_research.add_argument("--rounds", type=int, default=3)
+    factor_research.add_argument(
+        "--data-path",
+        type=Path,
+        default=None,
+        help="A 股日线 parquet 面板目录；未提供时读取 AUTOALPHA_DATA_PATH 或服务设置",
+    )
+    factor_research.add_argument("--output-dir", type=Path, default=None)
     return parser
 
 
@@ -54,6 +74,15 @@ def main() -> None:
     elif args.command == "inspect-data":
         report = inspect_current_panel(args.path)
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    elif args.command == "factor-research":
+        summary = run_factor_research(
+            args.research_direction,
+            candidates_per_round=args.candidates_per_round,
+            rounds=args.rounds,
+            data_path=args.data_path,
+            output_dir=args.output_dir,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -2833,9 +2833,20 @@ class ServiceStore:
             if row is None:
                 raise KeyError(f"System job not found: {job_id}")
             status = str(row["status"])
-            terminal = {"COMPLETED", "FAILED", "CANCELLED", "BLOCKED_UNSUPPORTED"}
+            terminal = {
+                "COMPLETED",
+                "PARTIAL_COMPLETED",
+                "FAILED",
+                "CANCELLED",
+                "BLOCKED_UNSUPPORTED",
+            }
             if status in terminal:
                 raise RuntimeError(f"System job is terminal: {status}")
+            if str(row["job_type"]) == "factor_research" and command_key in {
+                "pause",
+                "resume",
+            }:
+                raise RuntimeError("factor_research does not support pause/resume")
 
             if command_key == "cancel":
                 if status in {"QUEUED", "PAUSED"}:

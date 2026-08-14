@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,16 @@ from typing import Any
 from autoalpha.config import ResearchConfig
 from autoalpha.data.research_fields import expression_fields
 from autoalpha.data.workspace import inspect_data_workspace
+from autoalpha.registry.store import FactorRegistry
 from autoalpha.service.autocombine import DEFAULT_CONSTRUCTION, OBJECTIVE_PRESETS
 from autoalpha.service.autocombine_store import AutoCombineStore
 from autoalpha.service.direction import classify_mechanism
 from autoalpha.service.factor_behavior import load_behavior_snapshot
 from autoalpha.service.factor_homogeneity import build_homogeneity_report
+from autoalpha.service.factor_research import (
+    build_factor_research_web_result,
+    run_factor_research,
+)
 from autoalpha.service.gate_feedback import (
     append_gate_feedback_notes,
     apply_gate_feedback,
@@ -50,6 +56,7 @@ from autoalpha.service.strategy_bus import (
 )
 
 SUPPORTED_SYSTEM_JOB_TYPES = {
+    "factor_research",
     "factor_library_refresh",
     "factor_homogeneity_backfill",
     "factor_knowledge_map_sync",
@@ -72,6 +79,40 @@ SNAPSHOT_TTLS = {
 }
 
 
+def _factor_research_public_context(
+    task: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+    config: Any,
+) -> dict[str, Any]:
+    """Build the explicit public context persisted by factor research.
+
+    ResearchTask protocols also contain sealed holdout dates. They are needed
+    by readiness/configuration, but are not part of the Web or artifact
+    contract. Keep this projection allow-listed rather than relying on
+    downstream redaction.
+    """
+
+    protocol = task.get("protocol") or {}
+    public_context: dict[str, Any] = {
+        "research_task_id": task.get("task_id"),
+        "market": task.get("market"),
+        "snapshot": {"hash": task.get("snapshot_hash")},
+        "protocol_hash": task.get("protocol_hash"),
+        "evidence_tier": readiness.get("research_evidence_tier"),
+        "exploration": {
+            "start": config.splits.train.start.isoformat(),
+            "end": config.splits.train.end.isoformat(),
+        },
+        "public_validation": {
+            "start": config.splits.validation.start.isoformat(),
+            "end": config.splits.validation.end.isoformat(),
+        },
+    }
+    if protocol.get("minimum_folds") is not None:
+        public_context["minimum_folds"] = protocol["minimum_folds"]
+    return public_context
+
+
 class SystemJobRunner:
     """Execute small control-plane jobs through the unified system_jobs queue."""
 
@@ -84,6 +125,7 @@ class SystemJobRunner:
         runtime_root: Path,
         market_data_sync_runner: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         factor_library_builder: Callable[[], dict[str, Any]] | None = None,
+        research_task_manager: Any | None = None,
         worker_id: str = "autoalpha-system-job-runner",
     ) -> None:
         self.store = store
@@ -92,6 +134,7 @@ class SystemJobRunner:
         self.runtime_root = runtime_root
         self.market_data_sync_runner = market_data_sync_runner
         self.factor_library_builder = factor_library_builder
+        self.research_task_manager = research_task_manager
         self.worker_id = worker_id
 
     def run_next(
@@ -137,7 +180,9 @@ class SystemJobRunner:
 
     def run_claimed(self, job: dict[str, Any]) -> dict[str, Any]:
         job_type = str(job["job_type"])
-        if job_type == "factor_library_refresh":
+        if job_type == "factor_research":
+            result = self.run_factor_research(job)
+        elif job_type == "factor_library_refresh":
             result = self.materialize_factor_library(job)
         elif job_type == "factor_homogeneity_backfill":
             result = self.backfill_factor_homogeneity(job)
@@ -189,16 +234,173 @@ class SystemJobRunner:
                 lease_expires_at=None,
                 heartbeat_at=None,
             )
+        completion_status = (
+            "PARTIAL_COMPLETED"
+            if job_type == "factor_research" and result.get("status") == "PARTIAL_COMPLETED"
+            else "COMPLETED"
+        )
+        result_progress = result.get("progress") or {}
+        progress_current = (
+            result_progress.get("current")
+            if job_type == "factor_research"
+            else job.get("progress_total") or result.get("processed_count", 1)
+        )
+        progress_total = (
+            result_progress.get("total")
+            if job_type == "factor_research"
+            else job.get("progress_total") or result.get("processed_count", 1)
+        )
         return self.store.update_system_job(
             job["job_id"],
-            status="COMPLETED",
-            progress_current=job.get("progress_total") or result.get("processed_count", 1),
+            status=completion_status,
+            progress_current=int(progress_current or 0),
+            progress_total=int(progress_total or 0),
             result=result,
             lease_owner=None,
             lease_expires_at=None,
             heartbeat_at=_now(),
             finished_at=_now(),
         )
+
+    def run_factor_research(self, job: dict[str, Any]) -> dict[str, Any]:
+        if self.research_task_manager is None:
+            raise RuntimeError("ResearchTaskManager is not configured for factor_research")
+        payload = job.get("payload") or {}
+        task_id = str(payload.get("research_task_id") or "").strip()
+        direction = str(payload.get("research_direction") or "").strip()
+        if not task_id:
+            raise ValueError("factor_research requires research_task_id")
+        if not direction:
+            raise ValueError("factor_research requires research_direction")
+        candidates_per_round = int(payload.get("candidates_per_round") or 4)
+        rounds = int(payload.get("rounds") or 3)
+        context = self.research_task_manager.factor_research_context(task_id)
+        task = context["task"]
+        readiness = context["readiness"]
+        config = context["config"]
+        evaluator = context["evaluator"]
+        total_candidates = candidates_per_round * rounds
+        self.store.heartbeat_system_job(
+            job["job_id"],
+            worker_id=self.worker_id,
+            lease_seconds=3600,
+            progress_current=0,
+            checkpoint={
+                "phase": "factor_research",
+                "research_task_id": task_id,
+                "research_direction": direction,
+            },
+        )
+
+        def progress_callback(
+            current: int, total: int, checkpoint: Mapping[str, Any]
+        ) -> None:
+            try:
+                latest = self.store.system_job(str(job["job_id"]))
+                if latest["status"] != "RUNNING":
+                    return
+                self.store.heartbeat_system_job(
+                    job["job_id"],
+                    worker_id=self.worker_id,
+                    lease_seconds=3600,
+                    progress_current=current,
+                    checkpoint={
+                        **dict(checkpoint),
+                        "research_task_id": task_id,
+                        "progress_total": total,
+                    },
+                )
+            except (KeyError, RuntimeError):
+                # A cancel request is observed by the next callback/checkpoint.
+                return
+
+        def cancel_requested() -> bool:
+            try:
+                return self.store.system_job(str(job["job_id"]))["status"] == "CANCEL_REQUESTED"
+            except KeyError:
+                return False
+
+        public_context = _factor_research_public_context(task, readiness, config)
+        summary = run_factor_research(
+            direction,
+            candidates_per_round=candidates_per_round,
+            rounds=rounds,
+            evaluator=evaluator,
+            store=self.store,
+            registry=FactorRegistry(self.runtime_root / "factor-registry"),
+            artifact_root=self.runtime_root / "factor-research",
+            source_task_id=task_id,
+            research_context=public_context,
+            maximum_repairs_per_candidate=1,
+            progress_callback=progress_callback,
+            cancel_requested=cancel_requested,
+        )
+        result = build_factor_research_web_result(
+            summary,
+            artifact_prefix=f"factor-research/{summary['run_id']}",
+        )
+        result["job_id"] = job["job_id"]
+        result["research_task_id"] = task_id
+        result["factor_library_refresh"] = self._enqueue_factor_library_refresh(
+            job,
+            task_id=task_id,
+            run_id=str(summary["run_id"]),
+            keep_count=int((summary.get("counts") or {}).get("keep") or 0),
+        )
+        result["progress"] = {
+            "current": min(len(summary.get("candidates") or []), total_candidates),
+            "total": total_candidates,
+        }
+        return result
+
+    def _enqueue_factor_library_refresh(
+        self,
+        job: dict[str, Any],
+        *,
+        task_id: str,
+        run_id: str,
+        keep_count: int,
+    ) -> dict[str, Any] | None:
+        if keep_count <= 0:
+            return None
+        queued = next(
+            (
+                candidate
+                for candidate in self.store.system_jobs(
+                    queue="system", status="QUEUED", limit=200
+                )
+                if candidate.get("job_type") == "factor_library_refresh"
+            ),
+            None,
+        )
+        if queued is not None:
+            return {
+                "queued": True,
+                "deduplicated": True,
+                "job_id": queued["job_id"],
+                "queue": queued["queue"],
+            }
+        refresh = self.store.enqueue_system_job(
+            job_id=f"job-factor-library-{uuid.uuid4().hex[:12]}",
+            queue="system",
+            job_type="factor_library_refresh",
+            payload={
+                "source": "factor_research",
+                "source_job_id": job["job_id"],
+                "research_task_id": task_id,
+                "factor_research_run_id": run_id,
+            },
+            priority=45,
+            resource_group="sqlite-writer",
+            max_workers=1,
+            progress_total=1,
+        )
+        return {
+            "queued": True,
+            "deduplicated": False,
+            "job_id": refresh["job_id"],
+            "queue": refresh["queue"],
+        }
 
     def backfill_factor_homogeneity(self, job: dict[str, Any]) -> dict[str, Any]:
         payload = job.get("payload") or {}

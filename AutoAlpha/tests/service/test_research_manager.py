@@ -186,6 +186,50 @@ def test_manager_reports_protocol_and_market_readiness(tmp_path: Path, monkeypat
     assert any("仅支持 A 股" in blocker for blocker in hong_kong["blockers"])
 
 
+def test_factor_research_context_uses_task_data_and_public_protocol(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ServiceStore(tmp_path / "service.sqlite3")
+    _task(store, "task-factor")
+    manager = ResearchTaskManager(
+        store,
+        SecretVault(api_key="test"),
+        config_path=Path("config/research.toml"),
+        artifact_root=tmp_path / "artifacts",
+    )
+    monkeypatch.setattr(
+        manager,
+        "readiness",
+        lambda task_id: {
+            "runnable": True,
+            "blockers": [],
+            "research_evidence_tier": "REGIME_SLICE_ONLY",
+            "public_range": {"start": "2018-01-01", "end": "2024-12-31"},
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def fake_evaluator(data_path, *, config):  # noqa: ANN001
+        captured["data_path"] = data_path
+        captured["config"] = config
+        return SimpleNamespace(data_path=data_path, config=config)
+
+    monkeypatch.setattr(
+        "autoalpha.service.research_manager.PriceVolumeEvaluator", fake_evaluator
+    )
+
+    context = manager.factor_research_context("task-factor")
+    task = store.research_task("task-factor")
+    assert task is not None
+    assert Path(captured["data_path"]).as_posix() == Path(task["data_path"]).as_posix()
+    config = captured["config"]
+    assert config.splits.train.start.isoformat() == task["protocol"]["exploration_start"]
+    assert config.splits.validation.end.isoformat() == task["protocol"]["validation_end"]
+    assert Path(context["evaluator"].data_path).as_posix() == Path(
+        task["data_path"]
+    ).as_posix()
+
+
 def test_candidate_level_failure_classifier_covers_metric_and_coverage_errors() -> None:
     assert _candidate_level_failure_reason(
         ValueError("Evaluation produced non-finite metrics")
