@@ -79,6 +79,40 @@ SNAPSHOT_TTLS = {
 }
 
 
+def _factor_research_public_context(
+    task: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+    config: Any,
+) -> dict[str, Any]:
+    """Build the explicit public context persisted by factor research.
+
+    ResearchTask protocols also contain sealed holdout dates. They are needed
+    by readiness/configuration, but are not part of the Web or artifact
+    contract. Keep this projection allow-listed rather than relying on
+    downstream redaction.
+    """
+
+    protocol = task.get("protocol") or {}
+    public_context: dict[str, Any] = {
+        "research_task_id": task.get("task_id"),
+        "market": task.get("market"),
+        "snapshot": {"hash": task.get("snapshot_hash")},
+        "protocol_hash": task.get("protocol_hash"),
+        "evidence_tier": readiness.get("research_evidence_tier"),
+        "exploration": {
+            "start": config.splits.train.start.isoformat(),
+            "end": config.splits.train.end.isoformat(),
+        },
+        "public_validation": {
+            "start": config.splits.validation.start.isoformat(),
+            "end": config.splits.validation.end.isoformat(),
+        },
+    }
+    if protocol.get("minimum_folds") is not None:
+        public_context["minimum_folds"] = protocol["minimum_folds"]
+    return public_context
+
+
 class SystemJobRunner:
     """Execute small control-plane jobs through the unified system_jobs queue."""
 
@@ -286,27 +320,7 @@ class SystemJobRunner:
             except KeyError:
                 return False
 
-        public_context = {
-            "research_task_id": task_id,
-            "market": task.get("market"),
-            "snapshot": {
-                "hash": task.get("snapshot_hash"),
-                "data_start": task.get("data_start"),
-                "data_end": task.get("data_end"),
-            },
-            "protocol": task.get("protocol") or {},
-            "protocol_hash": task.get("protocol_hash"),
-            "evidence_tier": readiness.get("research_evidence_tier"),
-            "public_range": readiness.get("public_range"),
-            "exploration": {
-                "start": config.splits.train.start.isoformat(),
-                "end": config.splits.train.end.isoformat(),
-            },
-            "public_validation": {
-                "start": config.splits.validation.start.isoformat(),
-                "end": config.splits.validation.end.isoformat(),
-            },
-        }
+        public_context = _factor_research_public_context(task, readiness, config)
         summary = run_factor_research(
             direction,
             candidates_per_round=candidates_per_round,
@@ -349,22 +363,22 @@ class SystemJobRunner:
     ) -> dict[str, Any] | None:
         if keep_count <= 0:
             return None
-        existing = None
-        for status in ("QUEUED", "RUNNING"):
-            for candidate in self.store.system_jobs(
-                queue="system", status=status, limit=200
-            ):
-                if candidate.get("job_type") == "factor_library_refresh":
-                    existing = candidate
-                    break
-            if existing is not None:
-                break
-        if existing is not None:
+        queued = next(
+            (
+                candidate
+                for candidate in self.store.system_jobs(
+                    queue="system", status="QUEUED", limit=200
+                )
+                if candidate.get("job_type") == "factor_library_refresh"
+            ),
+            None,
+        )
+        if queued is not None:
             return {
                 "queued": True,
                 "deduplicated": True,
-                "job_id": existing["job_id"],
-                "queue": existing["queue"],
+                "job_id": queued["job_id"],
+                "queue": queued["queue"],
             }
         refresh = self.store.enqueue_system_job(
             job_id=f"job-factor-library-{uuid.uuid4().hex[:12]}",

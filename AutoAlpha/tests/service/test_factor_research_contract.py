@@ -236,6 +236,57 @@ def test_factor_research_system_job_completes_and_uses_task_context(
     ]
 
 
+def test_factor_research_public_context_excludes_holdout_from_get_and_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ServiceStore(tmp_path / "service.sqlite3")
+    task = _task(store)
+    hidden_dates = {
+        task["protocol"]["holdout_start"],
+        task["protocol"]["holdout_end"],
+    }
+    manager = FakeResearchTaskManager(store, ContractEvaluator())
+    researcher = ContractResearcher([_proposal("safe")])
+    module = __import__("autoalpha.service.system_jobs", fromlist=["run_factor_research"])
+    real_run = module.run_factor_research
+
+    def run_with_researcher(direction: str, **kwargs):  # noqa: ANN001
+        return real_run(direction, researcher=researcher, **kwargs)
+
+    monkeypatch.setattr(module, "run_factor_research", run_with_researcher)
+    runtime_root = tmp_path / "runtime"
+    _enqueue_factor_job(store)
+    result = _runner(store, manager, runtime_root).run_next(queue="factor-research")
+    assert result["job"]["status"] == "COMPLETED"
+
+    monkeypatch.setattr(service_app, "store", store)
+    monkeypatch.setenv("AUTOALPHA_SYSTEM_JOB_WORKER_ENABLED", "false")
+    with TestClient(service_app.app) as client:
+        client.cookies.set("autoalpha_session", "local")
+        response = client.get(
+            f"/api/factor-research/runs/{result['job']['job_id']}"
+        )
+
+    assert response.status_code == 200
+    payload_text = json.dumps(response.json(), ensure_ascii=False)
+    artifact_path = next((runtime_root / "factor-research").glob("*/research_summary.json"))
+    artifact_text = artifact_path.read_text(encoding="utf-8")
+    for text in ("holdout_start", "holdout_end", "hidden_test_range", *hidden_dates):
+        assert text not in payload_text
+        assert text not in artifact_text
+    context = response.json()["factor_research"]["result"]["research_context"]
+    assert set(context) == {
+        "research_task_id",
+        "market",
+        "snapshot",
+        "protocol_hash",
+        "evidence_tier",
+        "exploration",
+        "public_validation",
+        "minimum_folds",
+    }
+
+
 def test_single_candidate_failure_does_not_crash_factor_research_job(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -336,6 +387,67 @@ def test_keep_enqueues_existing_factor_library_refresh_and_materializes_keep(
     assert refresh_result["job"]["status"] == "COMPLETED"
     assert snapshot is not None
     assert keep_id in {item["factor_id"] for item in snapshot["payload"]["factors"]}
+
+
+def test_keep_after_running_factor_library_refresh_enqueues_successor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = ServiceStore(tmp_path / "service.sqlite3")
+    _task(store)
+    running = store.enqueue_system_job(
+        job_id="job-factor-library-running",
+        queue="system",
+        job_type="factor_library_refresh",
+        payload={"source": "previous-factor-research"},
+        resource_group="sqlite-writer",
+        max_workers=1,
+        progress_total=1,
+    )
+    store.update_system_job(
+        running["job_id"],
+        status="RUNNING",
+        lease_owner="other-worker",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+    )
+    manager = FakeResearchTaskManager(store, ContractEvaluator())
+    researcher = ContractResearcher([_proposal("keep-after-running")])
+    module = __import__("autoalpha.service.system_jobs", fromlist=["run_factor_research"])
+    real_run = module.run_factor_research
+
+    def run_with_researcher(direction: str, **kwargs):  # noqa: ANN001
+        return real_run(direction, researcher=researcher, **kwargs)
+
+    monkeypatch.setattr(module, "run_factor_research", run_with_researcher)
+
+    def builder() -> dict:
+        keeps = [item for item in store.factor_pool() if item["status"] == "KEEP"]
+        return {
+            "summary": {"factor_count": len(keeps)},
+            "factors": [{"factor_id": item["factor_id"]} for item in keeps],
+            "research_tasks": [{"task_id": "task-factor"}],
+            "data": {},
+            "knowledge_integrity": {"protocol": "AUTOALPHA_FACTOR_KNOWLEDGE_INTEGRITY_V1"},
+        }
+
+    _enqueue_factor_job(store)
+    factor_result = _runner(
+        store, manager, tmp_path / "runtime", builder=builder
+    ).run_next(queue="factor-research")
+    refresh_jobs = [
+        job
+        for job in store.system_jobs(queue="system")
+        if job["job_type"] == "factor_library_refresh"
+    ]
+    successor = next(job for job in refresh_jobs if job["job_id"] != running["job_id"])
+
+    assert factor_result["job"]["result"]["factor_library_refresh"] == {
+        "queued": True,
+        "deduplicated": False,
+        "job_id": successor["job_id"],
+        "queue": "system",
+    }
+    assert successor["status"] == "QUEUED"
+    assert successor["job_id"] != running["job_id"]
 
 
 def test_factor_research_pause_resume_is_explicitly_unsupported(tmp_path: Path) -> None:

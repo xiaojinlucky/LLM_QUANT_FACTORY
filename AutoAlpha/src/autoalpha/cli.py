@@ -35,11 +35,10 @@ def _parser() -> argparse.ArgumentParser:
     factor_research.add_argument("research_direction", help="research direction for the Researcher")
     factor_research.add_argument(
         "--candidates-per-round",
-        "--candidate-count",
         dest="candidates_per_round",
         type=int,
         default=4,
-        help="每轮最多生成的新候选数；--candidate-count 为兼容旧 CLI 的别名",
+        help="每轮最多生成的新候选数",
     )
     factor_research.add_argument("--rounds", type=int, default=3)
     factor_research.add_argument(
